@@ -52,6 +52,44 @@ For message notifications, the phone has to grant notification access. iOS asks
 once, per device: Settings → Bluetooth → ⓘ next to this machine → allow
 notifications.
 
+## What this plugin runs
+
+Omarchy plugins run unsandboxed with your user's permissions, so here is
+everything this one does, in full.
+
+**Background services.** Three transient systemd *user* units, started when
+speaker mode is on and stopped when it is off, when the plugin is disabled or
+removed, or by the uninstall command:
+
+| Unit | Purpose |
+|------|---------|
+| `omarchy-speaker-mpris` | `mpris-proxy` from bluez-utils, so media keys control the phone |
+| `omarchy-speaker-notify` | message notifications over MAP |
+| `omarchy-speaker-volume` | volume mirroring via AVRCP absolute volume |
+
+**Commands it calls.** `bluetoothctl`, `busctl`, `pactl`, `pw-dump`,
+`systemd-run`, `systemctl --user`, `notify-send`, `jq`, and `mpris-proxy`.
+
+**Privileges.** Nothing runs as root and nothing uses sudo at runtime. It talks
+to BlueZ on the system bus and to obexd and PipeWire on the session bus, all as
+your user. The only privileged steps are the two one-time setup commands under
+Requirements, which you run yourself.
+
+**Network.** None. Cover art comes from the phone over Bluetooth, not from the
+internet, and nothing is uploaded or reported anywhere.
+
+**What it reads and writes.** It reads the connected phone's media metadata,
+cover art, battery level, and — when notifications are enabled — incoming
+message senders and subjects, which are passed to your desktop notification
+daemon and never logged or stored. It writes settings to
+`$XDG_STATE_HOME/omarchy-speaker-mode` and cached cover art to
+`$XDG_CACHE_HOME/omarchy-speaker-mode`, and saves a cover to your Pictures
+folder only when you click the save button.
+
+**What it changes on your system, all at runtime and all reversed on `off`.**
+Adapter discoverability and its timeout, the connected phone's PipeWire card
+profile, and PipeWire loopbacks for microphone and audio routing.
+
 ## Install
 
 ```bash
@@ -61,7 +99,7 @@ omarchy plugin add https://github.com/corrreia/omarchy-speaker-mode --enable
 Then place it in the bar if you want it somewhere specific:
 
 ```bash
-omarchy bar move correia.speaker --section right
+omarchy bar move io.github.corrreia.speaker --section right
 ```
 
 ## Using it
@@ -117,8 +155,8 @@ Run this **before** removing the plugin — `omarchy plugin remove` deletes the
 directory and nothing else:
 
 ```bash
-~/.config/omarchy/plugins/correia.speaker/bin/omarchy-speaker-mode uninstall
-omarchy plugin remove correia.speaker
+~/.config/omarchy/plugins/io.github.corrreia.speaker/bin/omarchy-speaker-mode uninstall
+omarchy plugin remove io.github.corrreia.speaker
 ```
 
 The uninstall step restores Bluetooth, stops the background services, and
@@ -140,15 +178,15 @@ omarchy-speaker-mode uninstall
 Over the shell's IPC:
 
 ```bash
-omarchy-shell correia.speaker on|off|toggleSpeaker
-omarchy-shell correia.speaker open|cover|settings
+omarchy-shell io.github.corrreia.speaker on|off|toggleSpeaker
+omarchy-shell io.github.corrreia.speaker open|cover|settings
 ```
 
 To bind a key, add to `~/.config/hypr/bindings.lua`:
 
 ```lua
 o.bind("SUPER SHIFT", "S", "Toggle speaker mode",
-  "omarchy-shell correia.speaker toggleSpeaker")
+  "omarchy-shell io.github.corrreia.speaker toggleSpeaker")
 ```
 
 ## Implementation notes

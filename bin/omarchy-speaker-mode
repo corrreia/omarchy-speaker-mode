@@ -425,6 +425,33 @@ other software may rely on them. Remove them by hand if you want:
   sudo systemctl restart bluetooth
 EOF
 }
+
+# Where the phone's audio is actually going, which is not necessarily the
+# default sink. The Output setting moves the stream, and it can be moved by
+# hand in a mixer too — reporting the default would quietly disagree with both.
+# Before anything is streaming there is no stream to inspect, so fall back to
+# where it *would* go: the chosen output, or the default.
+active_sink() {
+  local idx name
+  idx=$(pactl -f json list sink-inputs 2>/dev/null \
+        | jq -r '.[] | select((.properties["node.name"] // "") | startswith("bluez_input")) | .sink' 2>/dev/null | head -1)
+  if [[ -n "$idx" ]]; then
+    name=$(pactl -f json list sinks 2>/dev/null \
+           | jq -r --argjson i "$idx" '.[] | select(.index == $i) | .name' 2>/dev/null | head -1)
+    [[ -n "$name" ]] && { printf '%s' "$name"; return 0; }
+  fi
+  name=$(output_get)
+  [[ -n "$name" ]] && { printf '%s' "$name"; return 0; }
+  default_sink
+}
+
+active_sink_description() {
+  local sink
+  sink=$(active_sink)
+  [[ -n "$sink" ]] || return 0
+  pactl -f json list sinks 2>/dev/null \
+    | jq -r --arg n "$sink" '.[] | select(.name == $n) | .description' 2>/dev/null | head -1
+}
 # ------------------------------------------------------------------- status
 
 # BlueZ publishes a battery percentage for a device whether or not anything is
@@ -535,8 +562,8 @@ status_json() {
     --arg mac "$mac" \
     --arg card "$name" \
     --arg profile "$active" \
-    --arg sink "$(default_sink)" \
-    --arg sinkDescription "$(default_sink_description)" \
+    --arg sink "$(active_sink)" \
+    --arg sinkDescription "$(active_sink_description)" \
     '{ enabled: $enabled, connected: $connected, streaming: $streaming,
        discoverable: $discoverable, mprisProxy: $mprisProxy,
        micActive: $micActive, micSource: $micSource,

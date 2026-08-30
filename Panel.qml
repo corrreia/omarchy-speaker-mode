@@ -16,8 +16,8 @@ import "Model.js" as Model
 // controls for whatever it is playing.
 Panel {
   id: root
-  moduleName: "correia.speaker"
-  ipcTarget: "correia.speaker"
+  moduleName: "io.github.corrreia.speaker"
+  ipcTarget: "io.github.corrreia.speaker"
   manageIpc: false
 
   // The helper ships inside the plugin, so the widget keeps working from a
