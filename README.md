@@ -17,7 +17,8 @@ A2DP, AVRCP, MAP, HFP — so Android and iOS take the same path.
 - **Media controls** — play, pause, skip, and your existing media keys
 - **Volume mirroring** — turn the phone up and the stream here follows, and back
 - **Message notifications** — texts from the phone appear on the desktop
-- **Microphone for calls** — pick which capture device the phone uses
+- **Microphone for calls** — pick which capture device the phone uses, *if*
+  your phone offers this machine an HFP link (see Known limitations)
 - **Output selection** — send the phone to any output, independently of the rest
   of your desktop audio
 
@@ -120,8 +121,9 @@ One collapsed section in the panel holds the preferences:
 - **Output** — which device the phone plays through. "System default" follows
   your desktop's own output.
 - **Microphone for calls** — which capture device the phone uses during a call.
-  Expect mono, narrowband audio on a call: that is how HFP works, and full
-  quality returns when the call ends.
+  See Known limitations before relying on this. If it does work, expect mono,
+  narrowband audio during the call: that is how HFP works, and full quality
+  returns when the call ends.
 - **Message notifications** — on or off.
 
 ## What "on" and "off" do
@@ -148,6 +150,29 @@ past it.
 The battery reading appears only when the phone is actually reporting one. It
 rides the Bluetooth LE link, which phones bring up and drop on their own, so it
 comes and goes.
+
+## Known limitations
+
+**The microphone has not been observed working.** The plumbing is in place —
+this machine advertises the Handsfree role, the picker selects a capture
+device, and the routing attaches as soon as an HFP link appears — but on the
+hardware this was built against, the phone has never established that link. It
+sends music over A2DP and keeps recording on its own microphone.
+
+The likely reason is that a phone decides per device whether something is
+call-capable, partly from its Bluetooth device class, and a desktop advertises
+itself as a computer rather than as a headset. If that is the cause, it is not
+something a plugin can fix without changing how the whole machine presents
+itself over Bluetooth, which is not a reasonable thing to ask of an installer.
+
+Treat the microphone setting as unproven. Everything else here — audio, cover
+art, media controls, volume mirroring and message notifications — is verified
+working.
+
+**Message notifications are SMS only**, for the reasons in the section above.
+
+**Battery** appears only while the phone is reporting one over the Bluetooth LE
+link, which phones bring up and drop on their own.
 
 ## Uninstall
 
