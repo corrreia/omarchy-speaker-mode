@@ -1,0 +1,796 @@
+#!/usr/bin/env bash
+# omarchy-speaker-mode — make this machine act as a Bluetooth speaker for a phone.
+#
+# The phone talks A2DP *source*, this machine takes the *sink* role, and the
+# incoming stream lands on whatever PipeWire sink is currently the default.
+# Everything here is runtime state: no daemon restarts, no config files
+# rewritten, so `off` puts Bluetooth back exactly as it was.
+#
+# Scope discipline: only cards that advertise the `audio-gateway` profile are
+# ever touched. That profile is what BlueZ offers for an A2DP *source* device
+# (a phone). Headphones, speakers, mice and keyboards expose different
+# profiles and are left completely alone.
+#
+#   omarchy-speaker-mode on|off|toggle
+#   omarchy-speaker-mode sync       # re-apply desired state (cheap, idempotent)
+#   omarchy-speaker-mode status     # JSON for the shell plugin
+
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-speaker-mode"
+STATE_FILE="$STATE_DIR/enabled"
+LOOPBACK_FILE="$STATE_DIR/loopback-module"
+MPRIS_UNIT="omarchy-speaker-mpris"
+
+mkdir -p "$STATE_DIR"
+
+# ---------------------------------------------------------------- primitives
+
+enabled() { [[ -f "$STATE_FILE" ]]; }
+
+bt() { bluetoothctl "$@" >/dev/null 2>&1; }
+
+# Emit one line per phone-shaped Bluetooth card:
+#   <card name> <TAB> <active profile> <TAB> <comma-separated profiles>
+# A card qualifies only when `audio-gateway` is among its profiles.
+phone_cards() {
+  pactl list cards 2>/dev/null | awk '
+    /^Card #/                { name=""; active=""; profs=""; inprof=0 }
+    /^\tName: /              { name=$2 }
+    /^\tProfiles:/           { inprof=1; next }
+    /^\tActive Profile: /    { active=$3; inprof=0
+                               if (name ~ /^bluez_card\./ && profs ~ /(^|,)audio-gateway(,|$)/)
+                                 printf "%s\t%s\t%s\n", name, active, profs
+                               next }
+    {
+      if (inprof && $0 ~ /^\t\t[a-z]/) {
+        split($1, p, ":")
+        profs = (profs == "" ? p[1] : profs "," p[1])
+      }
+    }
+  '
+}
+
+# MAC embedded in a bluez card name: bluez_card.AA_BB_… -> AA:BB:…
+card_mac() { sed 's/^bluez_card\.//; s/_/:/g' <<<"$1"; }
+
+default_sink() { pactl get-default-sink 2>/dev/null; }
+
+# The sink's Description is what the audio panel shows the user
+# ("Built-in Audio Analog Stereo"); its Name is a PCI path. Report both so the
+# panel never has to guess a readable label out of the name.
+default_sink_description() {
+  local sink
+  sink=$(default_sink)
+  [[ -n "$sink" ]] || return 0
+  pactl list sinks 2>/dev/null | awk -v want="$sink" '
+    /^\tName: /        { name=$2 }
+    /^\tDescription: / { if (name == want) { sub(/^\tDescription: /, ""); print; exit } }
+  '
+}
+
+# Nodes BlueZ created for an incoming phone stream. `media.class` tells us
+# which role PipeWire picked: a Stream/Output/Audio node is already being
+# played to the default sink, an Audio/Source node is a plain capture device
+# that needs a loopback before anything is audible.
+bluez_input_nodes() {
+  pw-dump 2>/dev/null | jq -c '
+    [ .[]
+      | select(.type == "PipeWire:Interface:Node")
+      | select((.info.props["node.name"] // "") | startswith("bluez_input"))
+      | { name:  .info.props["node.name"],
+          class: (.info.props["media.class"] // ""),
+          state: (.info.state // "") } ]' 2>/dev/null || echo '[]'
+}
+
+mpris_active() { systemctl --user is-active --quiet "$MPRIS_UNIT"; }
+
+start_mpris() {
+  mpris_active && return 0
+  # --collect so a crashed run does not leave a failed unit behind.
+  systemd-run --user --unit="$MPRIS_UNIT" --collect --quiet \
+    --description="Bluetooth AVRCP to MPRIS bridge (Omarchy speaker mode)" \
+    mpris-proxy >/dev/null 2>&1
+}
+
+stop_mpris() {
+  mpris_active || return 0
+  systemctl --user stop "$MPRIS_UNIT" >/dev/null 2>&1
+}
+
+# --------------------------------------------------------------- loopback
+
+# Only needed when PipeWire hands us the phone as a capture source instead of
+# a playback stream (bluez5.media-source-role = "input"). We create the
+# loopback ourselves rather than rewriting WirePlumber config, so turning
+# speaker mode off needs nothing more than unloading it.
+ensure_loopback() {
+  local source_node="$1" sink module
+  if [[ -f "$LOOPBACK_FILE" ]]; then
+    module=$(<"$LOOPBACK_FILE")
+    pactl list modules short 2>/dev/null | grep -q "^${module}[[:space:]]" && return 0
+    rm -f "$LOOPBACK_FILE"
+  fi
+  sink=$(default_sink)
+  [[ -n "$sink" ]] || return 1
+  module=$(pactl load-module module-loopback \
+    source="$source_node" sink="$sink" \
+    latency_msec=100 source_dont_move=true 2>/dev/null) || return 1
+  [[ -n "$module" ]] && printf '%s\n' "$module" > "$LOOPBACK_FILE"
+}
+
+drop_loopback() {
+  [[ -f "$LOOPBACK_FILE" ]] || return 0
+  local module
+  module=$(<"$LOOPBACK_FILE")
+  [[ -n "$module" ]] && pactl unload-module "$module" >/dev/null 2>&1
+  rm -f "$LOOPBACK_FILE"
+}
+
+
+# Discoverability normally lapses after DiscoverableTimeout seconds, which would
+# quietly make the machine unfindable while speaker mode still claims to be on.
+# Hold it open for the duration, and put the original value back on `off`.
+TIMEOUT_FILE="$STATE_DIR/discoverable-timeout"
+
+hold_discoverable() {
+  local current
+  current=$(bluetoothctl show 2>/dev/null | sed -n 's/.*DiscoverableTimeout: .*(\([0-9]\+\)).*/\1/p' | head -1)
+  if [[ -n "$current" && "$current" != "0" && ! -f "$TIMEOUT_FILE" ]]; then
+    printf '%s\n' "$current" > "$TIMEOUT_FILE"
+  fi
+  bt discoverable-timeout 0
+}
+
+release_discoverable() {
+  local previous=180
+  [[ -f "$TIMEOUT_FILE" ]] && previous=$(<"$TIMEOUT_FILE")
+  bt discoverable-timeout "$previous"
+  rm -f "$TIMEOUT_FILE"
+}
+connected_phone_mac() {
+  local name
+  IFS=$'\t' read -r name _ < <(phone_cards | head -1)
+  [[ -n "${name:-}" ]] && card_mac "$name"
+}
+
+
+# ---------------------------------------------------------------------- mic
+
+# Calls ride HFP, not A2DP. The phone is the Audio Gateway and this machine is
+# the Hands-Free unit, which PipeWire already supports — `hfp_hf` is in the
+# default `bluez5.roles`. What it does not do is decide which microphone to
+# send, so that is what lives here: pick a capture device, and loop it into the
+# phone's uplink for as long as a call is up.
+MIC_FILE="$STATE_DIR/mic-source"
+MIC_LOOPBACK_FILE="$STATE_DIR/mic-loopback-module"
+
+# Real capture devices only: monitors are speaker output fed back, and the
+# phone's own nodes would be a loop.
+list_sources() {
+  pw-dump 2>/dev/null | jq -c '
+    [ .[]
+      | select(.type == "PipeWire:Interface:Node")
+      | select((.info.props["media.class"] // "") == "Audio/Source")
+      | { name: (.info.props["node.name"] // ""),
+          description: (.info.props["node.description"] // .info.props["node.name"] // "") }
+      | select(.name != "")
+      | select((.name | endswith(".monitor")) | not)
+      | select((.name | startswith("bluez_")) | not) ]' 2>/dev/null || echo '[]'
+}
+
+mic_get() {
+  [[ -f "$MIC_FILE" ]] && printf '%s' "$(<"$MIC_FILE")"
+}
+
+mic_set() {
+  local name="${1:-}"
+  if [[ -z "$name" || "$name" == "default" ]]; then rm -f "$MIC_FILE"
+  else printf '%s\n' "$name" > "$MIC_FILE"; fi
+  drop_mic_loopback
+  enabled && sync_mic
+}
+
+# The uplink only exists while a call is up, which is exactly when we want to
+# be feeding it.
+phone_voice_sink() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 1
+  pw-dump 2>/dev/null | jq -r --arg p "bluez_output.${mac//:/_}" '
+    [ .[]
+      | select(.type == "PipeWire:Interface:Node")
+      | select((.info.props["node.name"] // "") | startswith($p))
+      | select((.info.props["media.class"] // "") == "Audio/Sink")
+      | .info.props["node.name"] ] | .[0] // empty' 2>/dev/null
+}
+
+drop_mic_loopback() {
+  [[ -f "$MIC_LOOPBACK_FILE" ]] || return 0
+  local module
+  module=$(<"$MIC_LOOPBACK_FILE")
+  [[ -n "$module" ]] && pactl unload-module "$module" >/dev/null 2>&1
+  rm -f "$MIC_LOOPBACK_FILE"
+}
+
+# Idempotent, and called from the same sync the rest of the state uses, so a
+# call that starts long after speaker mode was switched on still gets a mic.
+sync_mic() {
+  local mac sink source module
+  mac=$(connected_phone_mac)
+  [[ -n "$mac" ]] || { drop_mic_loopback; return 0; }
+
+  sink=$(phone_voice_sink "$mac")
+  if [[ -z "$sink" ]]; then drop_mic_loopback; return 0; fi
+
+  if [[ -f "$MIC_LOOPBACK_FILE" ]]; then
+    module=$(<"$MIC_LOOPBACK_FILE")
+    pactl list modules short 2>/dev/null | grep -q "^${module}[[:space:]]" && return 0
+    rm -f "$MIC_LOOPBACK_FILE"
+  fi
+
+  source=$(mic_get)
+  [[ -n "$source" ]] || source=$(pactl get-default-source 2>/dev/null)
+  [[ -n "$source" ]] || return 1
+
+  module=$(pactl load-module module-loopback \
+    source="$source" sink="$sink" \
+    latency_msec=40 source_dont_move=true sink_dont_move=true 2>/dev/null) || return 1
+  [[ -n "$module" ]] && printf '%s\n' "$module" > "$MIC_LOOPBACK_FILE"
+}
+
+mic_active() { [[ -f "$MIC_LOOPBACK_FILE" ]]; }
+
+# Message notifications ride MAP, a standard profile — the same path works on
+# Android. It needs a daemon rather than a one-shot call: obexd destroys a
+# session the moment the D-Bus client that created it disconnects, so something
+# has to hold the connection for as long as notifications should flow.
+NOTIFY_UNIT="omarchy-speaker-notify"
+NOTIFY_BIN="$(dirname "${BASH_SOURCE[0]}")/omarchy-speaker-notify"
+
+notify_active() { systemctl --user is-active --quiet "$NOTIFY_UNIT"; }
+
+start_notify() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 0
+  notify_active && return 0
+  [[ -x "$NOTIFY_BIN" ]] || return 1
+  systemd-run --user --unit="$NOTIFY_UNIT" --collect --quiet \
+    --description="Bluetooth MAP message notifications (Omarchy speaker mode)" \
+    "$NOTIFY_BIN" "$mac" >/dev/null 2>&1
+}
+
+stop_notify() {
+  notify_active || return 0
+  systemctl --user stop "$NOTIFY_UNIT" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------ settings
+
+# Which output the phone plays through. Empty means "follow whatever the
+# desktop's default sink is", which is the right default: change the system
+# output and the phone follows it without touching this.
+OUTPUT_FILE="$STATE_DIR/output-sink"
+NOTIFY_FILE="$STATE_DIR/notifications-off"
+
+list_sinks() {
+  pactl -f json list sinks 2>/dev/null | jq -c '
+    [ .[] | { name: .name,
+              description: (.description // .name) }
+          | select(.name != "") ]' 2>/dev/null || echo '[]'
+}
+
+output_get() { [[ -f "$OUTPUT_FILE" ]] && printf '%s' "$(<"$OUTPUT_FILE")"; }
+
+output_set() {
+  local name="${1:-}"
+  if [[ -z "$name" || "$name" == "default" ]]; then
+    rm -f "$OUTPUT_FILE"
+    # Going back to "follow the default" has to actually move the stream once,
+    # or the choice appears to do nothing until the next reconnect. After that
+    # the stream is left alone, so moving it by hand elsewhere still sticks.
+    enabled && move_phone_stream "$(default_sink)"
+  else
+    printf '%s\n' "$name" > "$OUTPUT_FILE"
+    enabled && route_output
+  fi
+}
+
+move_phone_stream() {
+  local target="${1:-}" id
+  [[ -n "$target" ]] || return 0
+  id=$(pactl -f json list sink-inputs 2>/dev/null \
+       | jq -r '.[] | select((.properties["node.name"] // "") | startswith("bluez_input")) | .index' 2>/dev/null | head -1)
+  [[ -n "$id" ]] || return 0
+  pactl move-sink-input "$id" "$target" >/dev/null 2>&1
+}
+
+# The phone's audio arrives as an ordinary playback stream, so sending it
+# somewhere else is just moving that stream. Done on every sync so a stream
+# that appears later — or reappears after a reconnect — lands in the right
+# place too.
+route_output() {
+  local target
+  target=$(output_get)
+  [[ -n "$target" ]] || return 0
+  move_phone_stream "$target"
+}
+
+# Notifications are opt-out rather than opt-in: they are part of what speaker
+# mode is for, but they are also the one piece that puts message content on
+# screen, so they get their own switch.
+notifications_enabled() { [[ ! -f "$NOTIFY_FILE" ]]; }
+
+notifications_set() {
+  case "${1:-on}" in
+    off|false|0) : > "$NOTIFY_FILE"; stop_notify ;;
+    *)           rm -f "$NOTIFY_FILE"; enabled && start_notify "$(connected_phone_mac)" ;;
+  esac
+}
+
+# Volume mirroring between the phone and its stream here. Like the notification
+# bridge this has to hold a connection — it watches D-Bus and `pactl subscribe`
+# — so it runs as its own unit rather than being polled.
+VOLUME_UNIT="omarchy-speaker-volume"
+VOLUME_BIN="$(dirname "${BASH_SOURCE[0]}")/omarchy-speaker-volume"
+
+volume_active() { systemctl --user is-active --quiet "$VOLUME_UNIT"; }
+
+start_volume() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 0
+  volume_active && return 0
+  [[ -x "$VOLUME_BIN" ]] || return 1
+  systemd-run --user --unit="$VOLUME_UNIT" --collect --quiet \
+    --description="Bluetooth volume mirror (Omarchy speaker mode)" \
+    "$VOLUME_BIN" "$mac" >/dev/null 2>&1
+}
+
+stop_volume() {
+  volume_active || return 0
+  systemctl --user stop "$VOLUME_UNIT" >/dev/null 2>&1
+}
+# ------------------------------------------------------------------ actions
+
+# Idempotent: safe to call on every poll. This is what picks up a phone that
+# connects minutes after speaker mode was switched on.
+apply_on() {
+  hold_discoverable
+  bt discoverable on
+  bt pairable on
+  start_mpris
+
+  local line name active
+  while IFS=$'\t' read -r name active _; do
+    [[ "$active" == "audio-gateway" ]] || pactl set-card-profile "$name" audio-gateway >/dev/null 2>&1
+  done < <(phone_cards)
+
+  local nodes
+  nodes=$(bluez_input_nodes)
+  if [[ $(jq -r 'map(select(.class == "Audio/Source")) | length' <<<"$nodes" 2>/dev/null || echo 0) -gt 0 ]]; then
+    ensure_loopback "$(jq -r 'map(select(.class == "Audio/Source")) | .[0].name' <<<"$nodes")"
+  else
+    drop_loopback
+  fi
+
+  notifications_enabled && start_notify "$(connected_phone_mac)"
+  start_volume "$(connected_phone_mac)"
+  route_output
+  sync_mic
+}
+
+# Full revert to ordinary Bluetooth: the phone stays paired, trusted and
+# connected as a normal device, it just stops being an audio source. Nothing
+# persists that would survive a reboot or need undoing by hand.
+apply_off() {
+  stop_volume
+  stop_notify
+  drop_mic_loopback
+  drop_bip_session "$(connected_phone_mac)"
+  drop_loopback
+  stop_mpris
+  bt discoverable off
+  release_discoverable
+
+  local name active
+  while IFS=$'\t' read -r name active _; do
+    [[ "$active" == "off" ]] || pactl set-card-profile "$name" off >/dev/null 2>&1
+  done < <(phone_cards)
+}
+
+
+# `omarchy plugin remove` deletes the plugin directory and nothing else — there
+# is no uninstall hook to run. Everything this plugin changes is runtime state,
+# so it can all be handed back, but something has to ask. This is that
+# something, and the README points at it.
+uninstall() {
+  apply_off
+  stop_volume
+  stop_notify
+  rm -rf "$STATE_DIR"
+  rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-speaker-mode"
+  cat <<'EOF'
+Speaker mode removed.
+
+  Bluetooth restored  the phone stays paired and connected as an ordinary
+                      device, discoverability and its timeout are back to
+                      what they were, and its audio card is idle again
+  Daemons stopped     media keys, notifications and volume mirroring
+  Deleted             saved settings and cached cover art
+
+Two things were installed system-wide for cover art and are left alone, since
+other software may rely on them. Remove them by hand if you want:
+
+  sudo pacman -R bluez-obex
+  sudo sed -i 's/^Experimental = true/#Experimental = false/' /etc/bluetooth/main.conf
+  sudo systemctl restart bluetooth
+EOF
+}
+# ------------------------------------------------------------------- status
+
+# BlueZ publishes a battery percentage for a device whether or not anything is
+# actually reporting one — an iPhone on A2DP alone leaves `Battery1` pinned at
+# 100 forever, because iOS sends battery over HFP (AT+IPHONEACCEV) and we do
+# not hold an HFP link.
+#
+# The real number is on the standard GATT Battery Service (0x180F,
+# characteristic 0x2A19), which the phone exposes once LE services resolve.
+# That is a plain Bluetooth SIG service, not an Apple one, so anything that
+# publishes it works the same way. Measured side by side: GATT said 82% while
+# Battery1 still claimed 100%.
+#
+# `Battery1.Source` names whichever provider fed that property, and is empty
+# exactly when the value is a phantom — so it is only trusted as a fallback
+# when something really is reporting.
+BATTERY_SERVICE="0000180f-0000-1000-8000-00805f9b34fb"
+BATTERY_CHAR="00002a19-0000-1000-8000-00805f9b34fb"
+
+gatt_battery_char() {
+  local mac="${1:-}" dev svc uuid
+  [[ -n "$mac" ]] || return 1
+  dev="dev_${mac//:/_}"
+  while read -r svc; do
+    [[ -n "$svc" ]] || continue
+    uuid=$(busctl --json=short get-property org.bluez "$svc" org.bluez.GattService1 UUID 2>/dev/null | jq -r '.data // empty')
+    [[ "${uuid,,}" == "$BATTERY_SERVICE" ]] || continue
+    while read -r ch; do
+      [[ -n "$ch" ]] || continue
+      uuid=$(busctl --json=short get-property org.bluez "$ch" org.bluez.GattCharacteristic1 UUID 2>/dev/null | jq -r '.data // empty')
+      if [[ "${uuid,,}" == "$BATTERY_CHAR" ]]; then printf '%s' "$ch"; return 0; fi
+    done < <(busctl tree org.bluez 2>/dev/null | grep -o "${svc}/char[0-9a-f]*\$")
+  done < <(busctl tree org.bluez 2>/dev/null | grep -o "/org/bluez/hci[0-9]*/${dev}/service[0-9a-f]*\$")
+  return 1
+}
+
+battery_percent() {
+  local mac="${1:-}" ch pct path source
+  [[ -n "$mac" ]] || return 1
+
+  if ch=$(gatt_battery_char "$mac"); then
+    pct=$(busctl --json=short call org.bluez "$ch" org.bluez.GattCharacteristic1 \
+            ReadValue "a{sv}" 0 2>/dev/null | jq -r '.data[0][0] // empty')
+    if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct <= 100 )); then printf '%s' "$pct"; return 0; fi
+  fi
+
+  path=$(busctl tree org.bluez 2>/dev/null | grep -o "/org/bluez/hci[0-9]*/dev_${mac//:/_}\$" | head -1)
+  [[ -n "$path" ]] || return 1
+  source=$(busctl --json=short get-property org.bluez "$path" org.bluez.Battery1 Source 2>/dev/null | jq -r '.data // empty')
+  [[ -n "$source" ]] || return 1
+  pct=$(busctl --json=short get-property org.bluez "$path" org.bluez.Battery1 Percentage 2>/dev/null | jq -r '.data // empty')
+  [[ "$pct" =~ ^[0-9]+$ ]] && printf '%s' "$pct"
+}
+
+status_json() {
+  local on=false name active mac device="" connected=false battery=-1
+  enabled && on=true
+
+  IFS=$'\t' read -r name active _ < <(phone_cards | head -1)
+  name=${name:-}
+  active=${active:-}
+
+  if [[ -n "$name" ]]; then
+    mac=$(card_mac "$name")
+    local info
+    info=$(bluetoothctl info "$mac" 2>/dev/null)
+    device=$(sed -n 's/^\s*Alias: //p' <<<"$info" | head -1)
+    grep -q "Connected: yes" <<<"$info" && connected=true
+    local pct
+    pct=$(battery_percent "$mac") && battery="$pct"
+  else
+    mac=""
+  fi
+
+  local nodes streaming=false
+  nodes=$(bluez_input_nodes)
+  [[ $(jq -r 'map(select(.state == "running")) | length' <<<"$nodes" 2>/dev/null || echo 0) -gt 0 ]] && streaming=true
+
+  local mic_source mic_on=false
+  mic_source=$(mic_get)
+  mic_active && mic_on=true
+  local notif=false
+  notify_active && notif=true
+  local vol_on=false
+  volume_active && vol_on=true
+  local notif_on=false output_sink
+  notifications_enabled && notif_on=true
+  output_sink=$(output_get)
+
+  local discoverable=false mpris=false
+  bluetoothctl show 2>/dev/null | grep -q "Discoverable: yes" && discoverable=true
+  mpris_active && mpris=true
+
+  jq -n \
+    --argjson enabled "$on" \
+    --argjson connected "$connected" \
+    --argjson streaming "$streaming" \
+    --argjson discoverable "$discoverable" \
+    --argjson mprisProxy "$mpris" \
+    --argjson micActive "$mic_on" \
+    --arg micSource "$mic_source" \
+    --argjson notifications "$notif" \
+    --argjson notificationsEnabled "$notif_on" \
+    --arg outputSink "$output_sink" \
+    --argjson volumeSync "$vol_on" \
+    --argjson battery "$battery" \
+    --arg device "$device" \
+    --arg mac "$mac" \
+    --arg card "$name" \
+    --arg profile "$active" \
+    --arg sink "$(default_sink)" \
+    --arg sinkDescription "$(default_sink_description)" \
+    '{ enabled: $enabled, connected: $connected, streaming: $streaming,
+       discoverable: $discoverable, mprisProxy: $mprisProxy,
+       micActive: $micActive, micSource: $micSource,
+       notifications: $notifications,
+       notificationsEnabled: $notificationsEnabled, outputSink: $outputSink,
+       volumeSync: $volumeSync,
+       battery: $battery, device: $device, mac: $mac,
+       card: $card, profile: $profile, sink: $sink,
+       sinkDescription: $sinkDescription }'
+}
+
+
+
+# ------------------------------------------------------------------ artwork
+
+# Cover art, over Bluetooth and nothing else. AVRCP 1.6 sends an image *handle*
+# alongside the track metadata; the image itself is pulled from the phone over
+# an OBEX Basic Imaging session on the L2CAP PSM the phone advertises. bluez
+# 5.87 implements both halves, but only with the `bluez-obex` package installed
+# and `Experimental = true` in /etc/bluetooth/main.conf — without those the
+# handle never appears and there is nothing to fetch.
+ART_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-speaker-mode/art"
+BIP_UUID="0000111A-0000-1000-8000-00805f9b34fb"
+
+avrcp_player() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 1
+  busctl tree org.bluez 2>/dev/null \
+    | grep -o "/org/bluez/hci[0-9]*/dev_${mac//:/_}/avrcp/player[0-9]*" | head -1
+}
+
+player_prop() {
+  busctl get-property org.bluez "$1" org.bluez.MediaPlayer1 "$2" 2>/dev/null
+}
+
+# The handle is only present while the phone is actually announcing a track.
+#
+# Read the track as JSON. busctl's text output escapes every non-ASCII byte as
+# octal, so an artist of "Green Day • Video Available" arrives as the literal
+# characters \342\200\242 — and no pattern expecting a bullet can ever match.
+track_field() {
+  busctl --json=short get-property org.bluez "$1" org.bluez.MediaPlayer1 Track 2>/dev/null \
+    | jq -r --arg k "$2" '.data[$k].data // empty' 2>/dev/null
+}
+
+# Reuse the imaging session across tracks — one per connection is the point.
+find_bip_session() {
+  local mac="${1:-}" path target dest
+  while read -r path; do
+    [[ -n "$path" ]] || continue
+    target=$(busctl --user get-property org.bluez.obex "$path" org.bluez.obex.Session1 Target 2>/dev/null | sed 's/^s //; s/"//g')
+    dest=$(busctl --user get-property org.bluez.obex "$path" org.bluez.obex.Session1 Destination 2>/dev/null | sed 's/^s //; s/"//g')
+    if [[ "${target^^}" == "${BIP_UUID^^}" && "$dest" == "$mac" ]]; then printf '%s' "$path"; return 0; fi
+  done < <(busctl --user tree org.bluez.obex 2>/dev/null | grep -o "/org/bluez/obex/client/session[0-9]*")
+  return 1
+}
+
+# The phone only listens on the cover-art PSM once it has decided we support
+# cover art, so a refused connect right after linking is normal — retry rather
+# than concluding it is unsupported.
+ensure_bip_session() {
+  local mac="${1:-}" player="${2:-}" existing psm out
+  existing=$(find_bip_session "$mac") && { printf '%s' "$existing"; return 0; }
+
+  psm=$(player_prop "$player" ObexPort | awk '{print $2}')
+  [[ "$psm" =~ ^[0-9]+$ ]] || return 1
+
+  out=$(busctl --user call org.bluez.obex /org/bluez/obex org.bluez.obex.Client1 \
+          CreateSession "sa{sv}" "$mac" 2 "Target" s "bip-avrcp" "PSM" q "$psm" 2>&1) || return 1
+  printf '%s' "$out" | grep -o "/org/bluez/obex/client/session[0-9]*"
+}
+
+# Transfers are asynchronous: the call returns a queued object, the file lands
+# later. Wait on the transfer's own status rather than guessing at the file.
+await_transfer() {
+  local transfer="${1:-}" status
+  for _ in $(seq 1 40); do
+    status=$(busctl --user get-property org.bluez.obex "$transfer" org.bluez.obex.Transfer1 Status 2>/dev/null | sed 's/^s //; s/"//g')
+    case "$status" in
+      complete) return 0 ;;
+      error)    return 1 ;;
+      "")       return 0 ;;   # object already gone: finished and cleaned up
+    esac
+    sleep 0.25
+  done
+  return 1
+}
+
+artwork() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 1
+
+  local player handle artist album key path subject
+  player=$(avrcp_player "$mac") || return 1
+  [[ -n "$player" ]] || return 1
+
+  handle=$(track_field "$player" ImgHandle)
+  [[ -n "$handle" ]] || return 1
+
+  # Key on the album so every track of a record reuses one file, and so a new
+  # session handing out fresh handles does not refetch what we already have.
+  artist=$(track_field "$player" Artist)
+  album=$(track_field "$player" Album)
+  mkdir -p "$ART_DIR"
+  # Spotify varies the artist it sends ("The Script" vs "The Script • Video
+  # Available"), which would split one album across two cache entries and pull
+  # the same image over the air twice. Key on the part before the bullet, with
+  # the space it leaves behind trimmed — otherwise the two still differ.
+  local subject="${artist%%•*}"
+  subject="${subject%"${subject##*[![:space:]]}"}"
+  key=$(printf '%s|%s' "$subject" "$album" | sha1sum | cut -d' ' -f1)
+  path="$ART_DIR/$key.jpg"
+  [[ -s "$path" ]] && { printf '%s\n' "$path"; return 0; }
+
+  local session transfer
+  session=$(ensure_bip_session "$mac" "$player") || return 1
+  [[ -n "$session" ]] || return 1
+
+  transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
+               GetThumbnail ss "$path" "$handle" 2>/dev/null \
+             | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
+  [[ -n "$transfer" ]] || { rm -f "$path"; return 1; }
+
+  if await_transfer "$transfer" && [[ -s "$path" ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  rm -f "$path"
+  return 1
+}
+
+
+
+# BIP calls the stored image "native", but that is not necessarily the biggest
+# on offer: this iPhone reports native 200x200 alongside a 280x280 variant, and
+# the variant carries real detail rather than being an upscale of the native
+# one — its Laplacian spread is ~1.75x, and the extra pixels resolve texture
+# that upscaling 200 cannot invent. So ask for the largest advertised
+# descriptor rather than accepting the default.
+#
+# Sizes that are not advertised are ignored and silently answered with native,
+# so there is no point guessing at larger ones.
+best_variant() {
+  local session="${1:-}" handle="${2:-}"
+  [[ -n "$session" && -n "$handle" ]] || return 1
+  busctl --user --json=short call org.bluez.obex "$session" org.bluez.obex.Image1 \
+      Properties s "$handle" 2>/dev/null \
+    | jq -r '[ .data[0][]
+               | select(.pixel)
+               | { pixel: .pixel.data,
+                   encoding: (.encoding.data // "JPEG"),
+                   area: ((.pixel.data | split("*") | .[0] | tonumber)
+                          * (.pixel.data | split("*") | .[1] | tonumber)) } ]
+             | sort_by(.area) | last
+             | if . then "\(.pixel)\t\(.encoding)" else empty end' 2>/dev/null
+}
+# The row shows a 200x200 thumbnail, which is all GetThumbnail returns. The
+# expanded view needs the real thing, so pull the full image on demand with
+# Image1.Get. Not every target offers a full-size variant; falling back to the
+# thumbnail keeps the expanded view populated rather than empty.
+artwork_full() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 1
+
+  local player handle artist album subject key path thumb session transfer
+  player=$(avrcp_player "$mac") || return 1
+  handle=$(track_field "$player" ImgHandle)
+  [[ -n "$handle" ]] || return 1
+
+  artist=$(track_field "$player" Artist)
+  album=$(track_field "$player" Album)
+  subject="${artist%%•*}"
+  subject="${subject%"${subject##*[![:space:]]}"}"
+  mkdir -p "$ART_DIR"
+  key=$(printf '%s|%s' "$subject" "$album" | sha1sum | cut -d' ' -f1)
+  path="$ART_DIR/$key-full.jpg"
+  [[ -s "$path" ]] && { printf '%s\n' "$path"; return 0; }
+
+  session=$(ensure_bip_session "$mac" "$player") || return 1
+
+  local best pixel encoding
+  best=$(best_variant "$session" "$handle")
+  pixel=$(cut -f1 <<<"$best")
+  encoding=$(cut -f2 <<<"$best")
+
+  if [[ -n "$pixel" ]]; then
+    transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
+                 Get "ssa{sv}" "$path" "$handle" 2 pixel s "$pixel" encoding s "${encoding:-JPEG}" 2>/dev/null \
+               | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
+  else
+    transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
+                 Get "ssa{sv}" "$path" "$handle" 0 2>/dev/null \
+               | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
+  fi
+
+  if [[ -n "$transfer" ]] && await_transfer "$transfer" && [[ -s "$path" ]]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+
+  rm -f "$path"
+  # No full-size variant: the thumbnail is better than nothing.
+  thumb=$(artwork "$mac") && { printf '%s\n' "$thumb"; return 0; }
+  return 1
+}
+
+# Save the current cover where the user can find it, named after the record
+# rather than a hash. Prefers the full image and falls back to the thumbnail.
+artwork_save() {
+  local mac="${1:-}" dest="${2:-$(xdg-user-dir PICTURES 2>/dev/null || printf '%s/Pictures' "$HOME")}"
+  [[ -n "$mac" ]] || return 1
+
+  local player artist album src name
+  player=$(avrcp_player "$mac") || return 1
+  artist=$(track_field "$player" Artist)
+  album=$(track_field "$player" Album)
+  artist="${artist%%•*}"
+  artist="${artist%"${artist##*[![:space:]]}"}"
+
+  src=$(artwork_full "$mac") || src=$(artwork "$mac") || return 1
+  [[ -s "$src" ]] || return 1
+
+  mkdir -p "$dest"
+  name="${artist:-Unknown} - ${album:-Cover}"
+  # Keep the filename portable: no slashes, no leading dots.
+  name=${name//\//-}
+  name=${name#.}
+  cp -f "$src" "$dest/$name.jpg" 2>/dev/null || return 1
+  chmod 644 "$dest/$name.jpg" 2>/dev/null
+  printf '%s\n' "$dest/$name.jpg"
+}
+drop_bip_session() {
+  local mac="${1:-}" session
+  session=$(find_bip_session "$mac") || return 0
+  busctl --user call org.bluez.obex /org/bluez/obex org.bluez.obex.Client1 \
+    RemoveSession o "$session" >/dev/null 2>&1
+}
+# --------------------------------------------------------------------- main
+
+case "${1:-status}" in
+  on)     : > "$STATE_FILE"; apply_on ;;
+  off)    rm -f "$STATE_FILE"; apply_off ;;
+  toggle) if enabled; then rm -f "$STATE_FILE"; apply_off; else : > "$STATE_FILE"; apply_on; fi ;;
+  sync)   if enabled; then apply_on; else drop_loopback; fi ;;
+  status) status_json ;;
+  uninstall) uninstall ;;
+  stop-daemons) stop_volume; stop_notify; stop_mpris ;;
+  artwork) artwork "${2:-}" ;;
+  sources) list_sources ;;
+  sinks) list_sinks ;;
+  output) case "${2:-get}" in set) output_set "${3:-}" ;; *) output_get; echo ;; esac ;;
+  notifications) case "${2:-get}" in set) notifications_set "${3:-on}" ;; *) notifications_enabled && echo on || echo off ;; esac ;;
+  mic) case "${2:-get}" in set) mic_set "${3:-}" ;; *) mic_get; echo ;; esac ;;
+  artwork-full) artwork_full "${2:-}" ;;
+  artwork-save) artwork_save "${2:-}" "${3:-}" ;;
+  *)      echo "usage: omarchy-speaker-mode {on|off|toggle|sync|status|uninstall|artwork MAC|artwork-full MAC|artwork-save MAC [DIR]}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,149 @@
+#!/usr/bin/python3
+# Pinned to /usr/bin/python3 deliberately: PyGObject lives in the system
+# interpreter, and a mise shim ahead of it on PATH does not have it.
+"""Bridge phone message notifications to the desktop over Bluetooth MAP.
+
+MAP (Message Access Profile) is a standard Bluetooth profile that both Android
+and iOS implement, so there is nothing vendor-specific here. It exposes the
+phone's *message store*, which means SMS: an iPhone advertises SupportedTypes
+SMS_GSM, so not even iMessage appears, and no third-party app ever will. The
+phone must grant notification access first — iOS asks once, per device, and
+refuses with OBEX 0xC3 Forbidden until it is given.
+
+This has to be a daemon rather than a shell-out: obexd destroys a session the
+moment the D-Bus client that created it disconnects, so something must hold the
+connection for as long as notifications should flow.
+
+Message contents are never logged. --debug prints event structure only.
+
+Usage: omarchy-speaker-notify <device-mac> [--debug]
+"""
+
+import os
+import sys
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+OBEX = "org.bluez.obex"
+MNS_TARGET = "BB582B41-420C-11DB-B0DE-0800200C9A66"
+
+DEBUG = "--debug" in sys.argv
+
+
+def log(*a):
+    if DEBUG:
+        print(*a, file=sys.stderr, flush=True)
+
+
+def notify(title, body):
+    """Hand off to the desktop. Contents are never logged."""
+    cmd = ["notify-send", "-a", "Messages", "-i", "phone", title or "Message"]
+    if body:
+        cmd.append(body)
+    import subprocess
+    subprocess.run(cmd, check=False)
+
+
+class Map:
+    def __init__(self, mac):
+        self.mac = mac
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.session = None
+        self.seen = set()
+
+    def start(self):
+        client = Gio.DBusProxy.new_sync(
+            self.bus, Gio.DBusProxyFlags.NONE, None,
+            OBEX, "/org/bluez/obex", "org.bluez.obex.Client1", None)
+        args = GLib.Variant("(sa{sv})",
+                            (self.mac, {"Target": GLib.Variant("s", "map")}))
+        self.session = client.call_sync("CreateSession", args,
+                                        Gio.DBusCallFlags.NONE, 30000, None)[0]
+        log("MAP session:", self.session)
+        self.bus.signal_subscribe(
+            OBEX, "org.freedesktop.DBus.ObjectManager", "InterfacesAdded",
+            None, None, Gio.DBusSignalFlags.NONE, self.on_interfaces_added)
+
+    def stop(self):
+        if not self.session:
+            return
+        try:
+            client = Gio.DBusProxy.new_sync(
+                self.bus, Gio.DBusProxyFlags.NONE, None,
+                OBEX, "/org/bluez/obex", "org.bluez.obex.Client1", None)
+            client.call_sync("RemoveSession",
+                             GLib.Variant("(o)", (self.session,)),
+                             Gio.DBusCallFlags.NONE, 10000, None)
+        except Exception as e:
+            log("RemoveSession failed:", e)
+        self.session = None
+
+    def on_interfaces_added(self, _c, _s, _p, _i, _sig, params):
+        obj, ifaces = params.unpack()
+        for name, props in ifaces.items():
+            if name == "org.bluez.obex.Session1" and props.get("Target") == MNS_TARGET:
+                log("phone opened its notification channel")
+            elif name == "org.bluez.obex.Message1":
+                # A phone re-reports the same message as its status changes;
+                # only the first sighting is news.
+                if obj in self.seen:
+                    return
+                self.seen.add(obj)
+                log("message event")
+                notify(props.get("Sender") or props.get("SenderAddress") or "Message",
+                       props.get("Subject", ""))
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
+        print("usage: omarchy-speaker-notify <device-mac> [--debug]",
+              file=sys.stderr)
+        return 2
+
+    bridge = Map(args[0])
+    try:
+        bridge.start()
+    except Exception as e:
+        print(f"speaker-notify: {e}", file=sys.stderr)
+        return 1
+
+    loop = GLib.MainLoop()
+
+    def bail(*_):
+        bridge.stop()
+        loop.quit()
+        return False
+
+    try:
+        gi.require_version("GLibUnix", "2.0")
+        from gi.repository import GLibUnix
+        add_signal = GLibUnix.signal_add
+    except (ValueError, ImportError):
+        add_signal = GLib.unix_signal_add
+    add_signal(GLib.PRIORITY_DEFAULT, 15, bail)
+    add_signal(GLib.PRIORITY_DEFAULT, 2, bail)
+
+    # `omarchy plugin remove` just deletes the directory — there is no
+    # uninstall hook to run. A daemon started from inside that directory would
+    # otherwise keep running against a plugin that no longer exists, so it
+    # notices its own removal and stops.
+    def still_installed():
+        if os.path.exists(__file__):
+            return True
+        log("plugin directory is gone; shutting down")
+        bail()
+        # bail() unwinds the loop, but give it a moment and then make sure the
+        # process is really gone rather than trusting it to be.
+        GLib.timeout_add_seconds(2, lambda: os._exit(0))
+        return False
+    GLib.timeout_add_seconds(30, still_installed)
+
+    loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

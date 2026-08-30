@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "correia.speaker",
+  "name": "Speaker Mode",
+  "version": "1.0.0",
+  "author": "correia",
+  "license": "MIT",
+  "description": "Turn this machine into a Bluetooth speaker for your phone, with on/off state in the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Speaker Mode",
+    "description": "Accept A2DP audio from a paired phone and play it on this machine's speakers.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 5
+      }
+    ]
+  }
+}

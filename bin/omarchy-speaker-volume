@@ -1,0 +1,271 @@
+#!/usr/bin/python3
+# Pinned to /usr/bin/python3 deliberately: PyGObject lives in the system
+# interpreter, and a mise shim ahead of it on PATH does not have it.
+"""Mirror volume between the phone and its stream on this machine.
+
+AVRCP Absolute Volume is already implemented on both sides — BlueZ exposes it
+as a writable `Volume` on org.bluez.MediaTransport1, on a 0-127 scale, and it
+emits a change whenever the phone's own slider moves. What is missing is the
+link to PipeWire: the transport volume and the phone's playback stream are
+tracked independently, so moving one leaves the other alone.
+
+This binds them, in both directions:
+
+  phone slider  -> MediaTransport1.Volume changes -> set the stream's volume
+  stream slider -> pactl reports a change         -> write MediaTransport1
+
+It is deliberately the *stream* volume — the "<phone>" slider in audio
+settings — and not the system output. Mirroring to the master would mean
+turning the phone down ducked the whole desktop.
+
+Usage: omarchy-speaker-volume <device-mac> [--debug]
+"""
+
+import json
+import subprocess
+import os
+import sys
+import time
+
+import gi
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+AVRCP_MAX = 127
+
+# Rounding between a 0-127 integer and a percentage never round-trips exactly:
+# set 50%, read back 49%, and each side "corrects" the other forever. A change
+# has to beat this deadband before it is treated as real.
+DEADBAND_PCT = 2
+
+# An echo of our own write arrives a moment after we make it. Anything inside
+# this window is assumed to be that echo rather than the user.
+ECHO_WINDOW = 0.6
+
+DEBUG = "--debug" in sys.argv
+
+
+def log(*a):
+    if DEBUG:
+        print(*a, file=sys.stderr, flush=True)
+
+
+def pactl_json(*args):
+    try:
+        out = subprocess.run(["pactl", "-f", "json", *args],
+                             capture_output=True, text=True, timeout=5)
+        return json.loads(out.stdout or "[]")
+    except Exception as e:
+        log("pactl failed:", e)
+        return []
+
+
+def avrcp_to_pct(v):
+    return max(0, min(100, round(v * 100 / AVRCP_MAX)))
+
+
+def pct_to_avrcp(p):
+    return max(0, min(AVRCP_MAX, round(p * AVRCP_MAX / 100)))
+
+
+class VolumeBridge:
+    def __init__(self, mac):
+        self.mac = mac
+        self.dev = "/org/bluez/hci0/dev_" + mac.replace(":", "_")
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.transport = None
+        self.last_write = 0.0
+        self.last_applied_pct = None
+
+    # -- the phone's side -------------------------------------------------
+
+    def find_transport(self):
+        """The A2DP sink transport, which only exists while audio is set up."""
+        om = Gio.DBusProxy.new_sync(
+            self.bus, Gio.DBusProxyFlags.NONE, None,
+            "org.bluez", "/", "org.freedesktop.DBus.ObjectManager", None)
+        objects = om.call_sync("GetManagedObjects", None,
+                               Gio.DBusCallFlags.NONE, 15000, None)[0]
+        for path, ifaces in objects.items():
+            t = ifaces.get("org.bluez.MediaTransport1")
+            if t and path.startswith(self.dev) and t.get("UUID", "").lower() == A2DP_SINK_UUID:
+                return path
+        return None
+
+    def transport_volume(self):
+        if not self.transport:
+            return None
+        try:
+            p = Gio.DBusProxy.new_sync(
+                self.bus, Gio.DBusProxyFlags.NONE, None,
+                "org.bluez", self.transport, "org.freedesktop.DBus.Properties", None)
+            return int(p.call_sync(
+                "Get", GLib.Variant("(ss)", ("org.bluez.MediaTransport1", "Volume")),
+                Gio.DBusCallFlags.NONE, 5000, None)[0])
+        except Exception:
+            return None
+
+    def set_transport_volume(self, value):
+        if not self.transport:
+            return
+        try:
+            p = Gio.DBusProxy.new_sync(
+                self.bus, Gio.DBusProxyFlags.NONE, None,
+                "org.bluez", self.transport, "org.freedesktop.DBus.Properties", None)
+            p.call_sync("Set", GLib.Variant(
+                "(ssv)", ("org.bluez.MediaTransport1", "Volume",
+                          GLib.Variant("q", value))),
+                Gio.DBusCallFlags.NONE, 5000, None)
+            self.last_write = time.monotonic()
+            log("-> phone:", value)
+        except Exception as e:
+            log("write to phone failed:", e)
+
+    # -- this machine's side ----------------------------------------------
+
+    def stream(self):
+        for s in pactl_json("list", "sink-inputs"):
+            name = (s.get("properties") or {}).get("node.name", "")
+            if name.startswith("bluez_input"):
+                return s
+        return None
+
+    @staticmethod
+    def stream_pct(s):
+        try:
+            return round(float(next(iter(s["volume"].values()))["value_percent"].rstrip("%")))
+        except Exception:
+            return None
+
+    def set_stream_pct(self, pct):
+        s = self.stream()
+        if not s:
+            return
+        subprocess.run(["pactl", "set-sink-input-volume", str(s["index"]), f"{pct}%"],
+                       check=False, capture_output=True)
+        self.last_applied_pct = pct
+        log("-> stream:", f"{pct}%")
+
+    # -- the two directions ------------------------------------------------
+
+    def on_transport_props(self, _c, _s, _p, _i, _sig, params):
+        iface, changed, _ = params.unpack()
+        if iface != "org.bluez.MediaTransport1" or "Volume" not in changed:
+            return
+        if time.monotonic() - self.last_write < ECHO_WINDOW:
+            log("ignoring echo of our own write")
+            return
+        pct = avrcp_to_pct(int(changed["Volume"]))
+        current = self.stream_pct(self.stream() or {})
+        if current is not None and abs(current - pct) <= DEADBAND_PCT:
+            return
+        log("phone ->", f"{pct}%")
+        self.set_stream_pct(pct)
+
+    def on_pactl_event(self, source, condition):
+        line = source.readline()
+        if not line:
+            return False
+        if "sink-input" not in line:
+            return True
+        s = self.stream()
+        if not s:
+            return True
+        pct = self.stream_pct(s)
+        if pct is None:
+            return True
+        # Do not answer our own change back to the phone.
+        if self.last_applied_pct is not None and abs(pct - self.last_applied_pct) <= DEADBAND_PCT:
+            return True
+        want = pct_to_avrcp(pct)
+        have = self.transport_volume()
+        if have is not None and abs(avrcp_to_pct(have) - pct) <= DEADBAND_PCT:
+            return True
+        log("stream ->", f"{pct}%")
+        self.set_transport_volume(want)
+        return True
+
+    # -- run ---------------------------------------------------------------
+
+    def sync_initial(self):
+        """Start from the phone's value: it is the one the user can see."""
+        v = self.transport_volume()
+        if v is None:
+            return
+        self.set_stream_pct(avrcp_to_pct(v))
+
+    def run(self):
+        self.transport = self.find_transport()
+        log("transport:", self.transport)
+
+        self.bus.signal_subscribe(
+            "org.bluez", "org.freedesktop.DBus.Properties", "PropertiesChanged",
+            None, None, Gio.DBusSignalFlags.NONE, self.on_transport_props)
+
+        if self.transport:
+            self.sync_initial()
+
+        # pactl has no D-Bus surface worth using here; its subscribe stream is
+        # the supported way to hear about volume changes as they happen.
+        proc = subprocess.Popen(["pactl", "subscribe"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, bufsize=1)
+        GLib.io_add_watch(proc.stdout, GLib.IO_IN, self.on_pactl_event)
+
+        # The transport disappears and returns with the audio link.
+        def rescan():
+            found = self.find_transport()
+            if found != self.transport:
+                self.transport = found
+                log("transport changed:", found)
+                if found:
+                    self.sync_initial()
+            return True
+        GLib.timeout_add_seconds(10, rescan)
+
+        loop = GLib.MainLoop()
+
+        def bail(*_):
+            proc.terminate()
+            loop.quit()
+            return False
+
+        try:
+            gi.require_version("GLibUnix", "2.0")
+            from gi.repository import GLibUnix
+            add_signal = GLibUnix.signal_add
+        except (ValueError, ImportError):
+            add_signal = GLib.unix_signal_add
+        add_signal(GLib.PRIORITY_DEFAULT, 15, bail)
+        add_signal(GLib.PRIORITY_DEFAULT, 2, bail)
+
+        # `omarchy plugin remove` just deletes the directory — there is no
+        # uninstall hook to run. A daemon started from inside that directory
+        # would otherwise keep running against a plugin that no longer exists,
+        # so it notices its own removal and stops.
+        def still_installed():
+            if os.path.exists(__file__):
+                return True
+            log("plugin directory is gone; shutting down")
+            bail()
+            # bail() unwinds the loop, but give it a moment and then make sure
+            # the process is really gone rather than trusting it to be.
+            GLib.timeout_add_seconds(2, lambda: os._exit(0))
+            return False
+        GLib.timeout_add_seconds(30, still_installed)
+
+        loop.run()
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
+        print("usage: omarchy-speaker-volume <device-mac> [--debug]", file=sys.stderr)
+        return 2
+    VolumeBridge(args[0]).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,18 @@
+# Nothing this plugin generates belongs in the repository. It writes runtime
+# state to $XDG_STATE_HOME/omarchy-speaker-mode and cached cover art to
+# $XDG_CACHE_HOME/omarchy-speaker-mode, both outside the plugin directory —
+# these entries are here in case anything is ever run from inside a checkout.
+*.log
+*.jpg
+*.jpeg
+*.png
+!preview.png
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS noise
+.DS_Store
