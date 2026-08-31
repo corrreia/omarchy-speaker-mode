@@ -509,7 +509,7 @@ Speaker mode removed.
 
   Bluetooth restored  the phone stays paired and connected as an ordinary
                       device, discoverability and its timeout are back to
-                      what they were, and its audio card is idle again
+                      what they were, and its audio profiles are disconnected
   Daemons stopped     media keys, notifications and volume mirroring
   Deleted             saved settings and cached cover art
 
