@@ -384,6 +384,7 @@ Panel {
               iconOpacity: speaker.enabled ? 1.0 : 0.5
               iconComponent: Component {
                 Text {
+                  textFormat: Text.PlainText
                   text: root.barIcon
                   color: speaker.streaming ? root.accent : root.foreground
                   font.family: root.fontFamily
@@ -439,6 +440,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: !speaker.connected
               width: parent.width
               text: "No phone connected. Pick this machine in your phone's Bluetooth output list."
@@ -484,6 +486,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 anchors.right: parent.right
                 anchors.verticalCenter: settingsLabel.verticalCenter
                 text: root.settingsOpen ? "󰅃" : "󰅀"
@@ -650,6 +653,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       anchors.centerIn: parent
                       visible: !artImage.visible
                       text: "󰝚"
@@ -785,6 +789,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: !bigArt.visible
                     text: "Loading cover…"
@@ -893,6 +898,7 @@ Panel {
   }
 
   component SettingLabel: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     opacity: 0.6
     font.family: root.fontFamily
