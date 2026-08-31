@@ -412,6 +412,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: text !== ""
             width: parent.width
             text: speaker.lastError !== "" ? speaker.lastError : speaker.detailText
@@ -681,6 +682,7 @@ Panel {
                     spacing: Style.space(2)
 
                     Text {
+                      textFormat: Text.PlainText
                       width: parent.width
                       text: root.trackTitle
                       color: root.foreground
@@ -690,6 +692,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       visible: root.trackArtist !== ""
                       width: parent.width
                       text: root.trackArtist
@@ -700,6 +703,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       visible: root.trackAlbum !== ""
                       width: parent.width
                       text: root.trackAlbum
@@ -813,6 +817,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   horizontalAlignment: Text.AlignHCenter
                   text: root.trackTitle
@@ -824,6 +829,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: root.trackArtist !== ""
                   width: parent.width
                   horizontalAlignment: Text.AlignHCenter
@@ -835,6 +841,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: root.trackAlbum !== ""
                   width: parent.width
                   horizontalAlignment: Text.AlignHCenter
@@ -908,6 +915,7 @@ Panel {
   }
 
   component InfoLabel: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     opacity: 0.6
     font.family: root.fontFamily
@@ -915,6 +923,7 @@ Panel {
   }
 
   component InfoValue: Text {
+    textFormat: Text.PlainText
     color: root.foreground
     font.family: root.fontFamily
     font.pixelSize: Style.font.bodySmall
