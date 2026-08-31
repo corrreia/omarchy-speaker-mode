@@ -154,6 +154,16 @@ connected_phone_mac() {
   [[ -n "${name:-}" ]] && card_mac "$name"
 }
 
+# BlueZ's object path for a device. Every D-Bus call against the phone needs
+# it, and the adapter number is not fixed, so it is looked up rather than
+# assumed to be hci0.
+device_path() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 1
+  busctl tree org.bluez 2>/dev/null \
+    | grep -o "/org/bluez/hci[0-9]*/dev_${mac//:/_}\$" | head -1
+}
+
 
 # ---------------------------------------------------------------------- mic
 
@@ -349,6 +359,61 @@ stop_volume() {
   volume_active || return 0
   systemctl --user stop "$VOLUME_UNIT" >/dev/null 2>&1
 }
+# ------------------------------------------------------- remembered device
+
+# Which phone to reach for when speaker mode comes on and nothing is connected.
+# BlueZ keeps no last-connected timestamp on D-Bus — `/var/lib/bluetooth` holds
+# one but is root-only — so the phone is remembered here instead, written every
+# time a sync sees one connected.
+LAST_DEVICE_FILE="$STATE_DIR/last-device"
+
+remember_phone() {
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || return 0
+  printf '%s\n' "$mac" > "$LAST_DEVICE_FILE"
+}
+
+# Paired devices that can play *to* this machine. `devices Paired` lists
+# everything ever bonded, headphones and mice included; the Audio Source UUID is
+# what marks a device as a source of audio rather than a consumer of it.
+paired_phones() {
+  local mac
+  while read -r _ mac _; do
+    [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || continue
+    bluetoothctl info "$mac" 2>/dev/null | grep -q "Audio Source" && printf '%s\n' "$mac"
+  done < <(bluetoothctl devices Paired 2>/dev/null)
+}
+
+# The remembered phone if it is still paired, otherwise the only candidate
+# there is. With several paired and nothing remembered there is no right
+# answer, so nothing is picked.
+remembered_phone() {
+  local mac
+  if [[ -f "$LAST_DEVICE_FILE" ]]; then
+    mac=$(<"$LAST_DEVICE_FILE")
+    if [[ -n "$mac" ]] && paired_phones | grep -qx "$mac"; then
+      printf '%s' "$mac"
+      return 0
+    fi
+  fi
+  local -a candidates
+  mapfile -t candidates < <(paired_phones)
+  [[ ${#candidates[@]} -eq 1 ]] && printf '%s' "${candidates[0]}"
+}
+
+# One attempt, detached. `bluetoothctl connect` blocks until the link is up or
+# the page scan gives up, which is far longer than the shell will wait for the
+# switch to throw — and this runs only from `on`, never from `sync`, so a phone
+# that is away is not paged every poll.
+try_connect_remembered() {
+  local mac
+  [[ -z "$(connected_phone_mac)" ]] || return 0
+  mac=$(remembered_phone)
+  [[ -n "$mac" ]] || return 0
+  setsid bluetoothctl --timeout 20 connect "$mac" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
 # ------------------------------------------------------------------ actions
 
 # Idempotent: safe to call on every poll. This is what picks up a phone that
@@ -359,7 +424,7 @@ apply_on() {
   bt pairable on
   start_mpris
 
-  local line name active
+  local name active
   while IFS=$'\t' read -r name active _; do
     [[ "$active" == "audio-gateway" ]] || pactl set-card-profile "$name" audio-gateway >/dev/null 2>&1
   done < <(phone_cards)
@@ -372,10 +437,46 @@ apply_on() {
     drop_loopback
   fi
 
-  notifications_enabled && start_notify "$(connected_phone_mac)"
-  start_volume "$(connected_phone_mac)"
+  local mac
+  mac=$(connected_phone_mac)
+  remember_phone "$mac"
+
+  notifications_enabled && start_notify "$mac"
+  start_volume "$mac"
   route_output
   sync_mic
+}
+
+# Audio profiles the phone offers. Dropping these is what actually ends the
+# speaker relationship: setting the card profile to `off` releases the local
+# audio node, but leaves the AVDTP link standing, so the phone goes on believing
+# it is playing to a speaker. The link itself has to go.
+AUDIO_UUIDS=(
+  "0000110a-0000-1000-8000-00805f9b34fb"   # Audio Source — the phone's A2DP end
+  "0000110e-0000-1000-8000-00805f9b34fb"   # A/V Remote Control
+)
+
+disconnect_audio() {
+  local mac="${1:-}" path uuid
+  [[ -n "$mac" ]] || return 0
+  path=$(device_path "$mac") || return 0
+  [[ -n "$path" ]] || return 0
+  for uuid in "${AUDIO_UUIDS[@]}"; do
+    busctl call org.bluez "$path" org.bluez.Device1 DisconnectProfile s "$uuid" >/dev/null 2>&1
+  done
+}
+
+# The half of `off` that has to stay true for as long as speaker mode is off,
+# rather than being applied once. The phone can re-establish A2DP whenever it
+# likes and BlueZ will accept it — a `bluez5.auto-connect` rule in WirePlumber
+# makes that the default on some setups — so `sync` calls this too.
+enforce_off() {
+  local name active
+  while IFS=$'\t' read -r name active _; do
+    [[ "$active" == "off" ]] || pactl set-card-profile "$name" off >/dev/null 2>&1
+    disconnect_audio "$(card_mac "$name")"
+  done < <(phone_cards)
+  drop_loopback
 }
 
 # Full revert to ordinary Bluetooth: the phone stays paired, trusted and
@@ -386,15 +487,10 @@ apply_off() {
   stop_notify
   drop_mic_loopback
   drop_bip_session "$(connected_phone_mac)"
-  drop_loopback
   stop_mpris
   bt discoverable off
   release_discoverable
-
-  local name active
-  while IFS=$'\t' read -r name active _; do
-    [[ "$active" == "off" ]] || pactl set-card-profile "$name" off >/dev/null 2>&1
-  done < <(phone_cards)
+  enforce_off
 }
 
 
@@ -498,7 +594,7 @@ battery_percent() {
     if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct <= 100 )); then printf '%s' "$pct"; return 0; fi
   fi
 
-  path=$(busctl tree org.bluez 2>/dev/null | grep -o "/org/bluez/hci[0-9]*/dev_${mac//:/_}\$" | head -1)
+  path=$(device_path "$mac") || return 1
   [[ -n "$path" ]] || return 1
   source=$(busctl --json=short get-property org.bluez "$path" org.bluez.Battery1 Source 2>/dev/null | jq -r '.data // empty')
   [[ -n "$source" ]] || return 1
@@ -804,10 +900,11 @@ drop_bip_session() {
 # --------------------------------------------------------------------- main
 
 case "${1:-status}" in
-  on)     : > "$STATE_FILE"; apply_on ;;
+  on)     : > "$STATE_FILE"; apply_on; try_connect_remembered ;;
   off)    rm -f "$STATE_FILE"; apply_off ;;
-  toggle) if enabled; then rm -f "$STATE_FILE"; apply_off; else : > "$STATE_FILE"; apply_on; fi ;;
-  sync)   if enabled; then apply_on; else drop_loopback; fi ;;
+  toggle) if enabled; then rm -f "$STATE_FILE"; apply_off
+          else : > "$STATE_FILE"; apply_on; try_connect_remembered; fi ;;
+  sync)   if enabled; then apply_on; else enforce_off; fi ;;
   status) status_json ;;
   uninstall) uninstall ;;
   stop-daemons) stop_volume; stop_notify; stop_mpris ;;

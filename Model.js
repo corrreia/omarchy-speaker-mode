@@ -133,11 +133,16 @@ function parseStatus(raw) {
   }
 }
 
-// True when the world has drifted from what "on" is supposed to look like —
-// a phone that connected after the switch was flipped, or discoverability
-// that lapsed. The service reacts by running the helper's `sync`.
+// True when the world has drifted from what the switch says it should look
+// like — a phone that connected after the switch was flipped, or
+// discoverability that lapsed. The service reacts by running the helper's
+// `sync`.
+//
+// "Off" needs watching as much as "on" does: the phone can re-establish its
+// audio profile at any time and BlueZ will accept it, so a card that has come
+// back to life while the switch is off is drift too.
 function needsSync(state) {
-  if (!state.enabled) return false
+  if (!state.enabled) return state.card !== "" && state.profile !== "off"
   if (!state.discoverable) return true
   if (!state.mprisProxy) return true
   if (state.card !== "" && state.profile !== "audio-gateway") return true

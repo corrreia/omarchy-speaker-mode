@@ -76,6 +76,43 @@ purpose.
 Symptom worth recognising if anyone tries again: **SMS keeps working, app
 notifications do not.**
 
+## `off` has to be held, not applied once
+
+Setting the phone's card profile to `off` releases the local audio node but
+leaves the AVDTP link standing, so the phone goes on believing it is playing to
+a speaker. `org.bluez.Device1.DisconnectProfile` with the phone's **Audio
+Source** UUID (`0000110a`) is what actually ends it: the `bluez_card`
+disappears while `bluetoothctl info` still reports `Connected: yes` — which is
+exactly the plain Bluetooth device the plugin promises to hand back.
+
+Doing it once is not enough. The phone can re-establish A2DP whenever it likes
+and BlueZ will accept it, and a `bluez5.auto-connect = [a2dp_sink a2dp_source]`
+rule in a WirePlumber drop-in makes that automatic. So `sync` calls
+`enforce_off` while the switch is off, and `Model.needsSync` reports drift for a
+card that has reappeared with a profile other than `off`.
+
+What none of this can do is hide the machine from the phone's speaker list. The
+adapter advertises **Audio Sink** (`0000110b`) permanently — WirePlumber
+registers the role when its bluez monitor loads, per adapter, not per device —
+so a paired phone will always offer this machine as an output. Removing it
+means dropping `a2dp_sink` from `bluez5.roles` and restarting WirePlumber: a
+config rewrite and a daemon restart, and this plugin does neither.
+
+## Which phone to reconnect to
+
+BlueZ publishes no last-connected time on D-Bus. `/var/lib/bluetooth` holds one
+but is root-only, so the plugin remembers the MAC itself, written on every sync
+that sees a phone connected.
+
+`devices Paired` lists everything ever bonded — headphones, mice, speakers — so
+it needs a filter. The **Audio Source** UUID is the right one: it marks a device
+that can play *to* this machine, as opposed to one that consumes audio from it.
+
+The reconnect is one detached attempt from `on`, never from `sync`. A
+`bluetoothctl connect` to an absent device blocks for the length of a page scan,
+which is far longer than the shell will wait for the switch to throw, and
+retrying every poll would page a phone that is simply elsewhere.
+
 ## Volume mirroring
 
 AVRCP Absolute Volume is already implemented on both sides — BlueZ exposes it

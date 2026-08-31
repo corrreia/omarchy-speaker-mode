@@ -89,7 +89,10 @@ folder only when you click the save button.
 
 **What it changes on your system, all at runtime and all reversed on `off`.**
 Adapter discoverability and its timeout, the connected phone's PipeWire card
-profile, and PipeWire loopbacks for microphone and audio routing.
+profile, and PipeWire loopbacks for microphone and audio routing. On `off` it
+disconnects the phone's Bluetooth audio profiles; on `on` it may connect to the
+phone it last saw. Pairing, trust and the rest of the Bluetooth link are never
+touched.
 
 ## Install
 
@@ -130,11 +133,22 @@ One collapsed section in the panel holds the preferences:
 
 Turning it **on** makes the machine discoverable, puts the phone's audio card
 into the right profile, and starts the media, notification and volume bridges.
+If nothing is connected it also makes one attempt to reach the phone it last
+saw, so the usual case is that you flip the switch and the phone is simply
+there. One attempt, not a retry loop — if the phone was asleep or out of range,
+connect it from the phone as before.
 
-Turning it **off** hands everything back. The phone stays paired, trusted and
-connected as an ordinary Bluetooth device — it just stops being an audio
-source. Discoverability and its timeout return to what they were, and nothing
-is left running.
+Turning it **off** hands everything back. It disconnects the phone's audio
+profiles, so the phone stops treating this machine as a speaker and its audio
+returns to its own output. The phone stays paired, trusted and connected as an
+ordinary Bluetooth device. Discoverability and its timeout return to what they
+were, and nothing is left running.
+
+Off is then held rather than applied once: a phone is free to re-establish its
+audio profile at any time, and the plugin drops it again within a poll. What it
+cannot do is remove this machine from the phone's list of available speakers —
+the adapter advertises the Bluetooth audio-sink role permanently, and that
+belongs to WirePlumber rather than to this plugin.
 
 ## Notes on what you'll see
 
