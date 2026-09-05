@@ -113,58 +113,47 @@ Item {
   }
 
   function setOutput(name) {
-    if (helper === "") return
+    if (helper === "" || outputProc.running) return
     outputSink = name === "default" ? "" : name
     outputProc.command = [helper, "output", "set", name]
     outputProc.running = true
   }
 
   function setNotifications(on) {
-    if (helper === "") return
+    if (helper === "" || notifyProc.running) return
     notificationsEnabled = on
     notifyProc.command = [helper, "notifications", "set", on ? "on" : "off"]
     notifyProc.running = true
   }
 
-  Process {
+  HelperProcess {
     id: sinksProc
     command: [root.helper, "sinks"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try { root.sinks = JSON.parse(String(text || "[]")) || [] }
-        catch (e) { root.sinks = [] }
-      }
+    onCollected: function(text) {
+      try { root.sinks = JSON.parse(text || "[]") || [] }
+      catch (e) { root.sinks = [] }
     }
   }
 
-  Process { id: outputProc; onExited: Qt.callLater(root.refresh) }
-  Process { id: notifyProc; onExited: Qt.callLater(root.refresh) }
-  Process {
+  // One in flight at a time for each: a second click while the first is still
+  // talking to PipeWire is dropped, and the refresh that follows shows what
+  // actually landed.
+  HelperProcess { id: outputProc; onExited: Qt.callLater(root.refresh) }
+  HelperProcess { id: notifyProc; onExited: Qt.callLater(root.refresh) }
+
+  HelperProcess {
     id: statusProc
     command: [root.helper, "status"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyStatus(text)
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var message = String(text || "").trim()
-        if (message !== "") root.lastError = message
-      }
-    }
+    onCollected: function(text) { root.applyStatus(text) }
+    onErrorTextChanged: if (errorText !== "") root.lastError = errorText
   }
 
-  Process {
+  // on/off/sync touch BlueZ, PipeWire and three units in turn, each under the
+  // helper's own per-command deadline, so this one is generous.
+  HelperProcess {
     id: actionProc
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var message = String(text || "").trim()
-        if (message !== "") root.lastError = message
-      }
-    }
+    deadlineMs: 60000
+    onErrorTextChanged: if (errorText !== "") root.lastError = errorText
     onExited: function(exitCode) {
       root.busy = false
       if (exitCode !== 0 && root.lastError === "")
@@ -183,25 +172,22 @@ Item {
   }
 
   function setMic(name) {
-    if (helper === "") return
+    if (helper === "" || micProc.running) return
     micSource = name === "default" ? "" : name
     micProc.command = [helper, "mic", "set", name]
     micProc.running = true
   }
 
-  Process {
+  HelperProcess {
     id: sourcesProc
     command: [root.helper, "sources"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try { root.sources = JSON.parse(String(text || "[]")) || [] }
-        catch (e) { root.sources = [] }
-      }
+    onCollected: function(text) {
+      try { root.sources = JSON.parse(text || "[]") || [] }
+      catch (e) { root.sources = [] }
     }
   }
 
-  Process {
+  HelperProcess {
     id: micProc
     onExited: Qt.callLater(root.refresh)
   }

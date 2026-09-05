@@ -16,17 +16,75 @@
 #   omarchy-speaker-mode status     # JSON for the shell plugin
 
 set -uo pipefail
+umask 077
+
+# Everything this script waits on — BlueZ, obexd, PipeWire, systemd — can hang,
+# and the shell widget is waiting on this script in turn. So every one of those
+# commands runs under a deadline, with the whole process group killed if it is
+# not gone a few seconds after the first signal. The names below shadow the
+# real commands for the rest of the file; `command` and `setsid` reach past
+# them where that is wanted.
+DEADLINE="${OMARCHY_SPEAKER_DEADLINE:-15}"
+deadline() { command timeout --kill-after=3 "$DEADLINE" "$@"; }
+bluetoothctl() { deadline bluetoothctl "$@"; }
+busctl()       { deadline busctl "$@"; }
+pactl()        { deadline pactl "$@"; }
+pw-dump()      { deadline pw-dump "$@"; }
+systemctl()    { deadline systemctl "$@"; }
+systemd-run()  { deadline systemd-run "$@"; }
+python3()      { deadline python3 "$@"; }
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-speaker-mode"
 STATE_FILE="$STATE_DIR/enabled"
 LOOPBACK_FILE="$STATE_DIR/loopback-module"
 MPRIS_UNIT="omarchy-speaker-mpris"
 
-mkdir -p "$STATE_DIR"
+# ---------------------------------------------------------------------- state
+
+# Nothing in the state directory is secret, but what is read back from it picks
+# PipeWire modules to unload, sinks to route to, and a phone to reconnect. So
+# the directory is private and must be a real directory of ours; files are
+# replaced by rename rather than written in place, which is atomic for readers
+# and swaps out a symlink instead of following one; and a value is only taken
+# back if it still has the shape it was written with.
+ensure_dir() {
+  local dir="$1"
+  if [[ -L "$dir" || ( -e "$dir" && ! -d "$dir" ) ]]; then
+    echo "omarchy-speaker-mode: $dir exists and is not a directory" >&2
+    exit 1
+  fi
+  mkdir -p -m 700 "$dir" && [[ -O "$dir" ]] && chmod 700 "$dir" || {
+    echo "omarchy-speaker-mode: cannot own $dir" >&2
+    exit 1
+  }
+  # Files written before the directory was private keep their old mode.
+  find "$dir" -maxdepth 1 -type f ! -perm 600 -exec chmod 600 {} + 2>/dev/null
+}
+
+state_put() {
+  local file="$1" value="${2:-}" tmp
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  { printf '%s\n' "$value" > "$tmp" && mv -f "$tmp" "$file"; } || { rm -f "$tmp"; return 1; }
+}
+
+state_get() {
+  local file="$1" pattern="$2" value=""
+  [[ -f "$file" && ! -L "$file" && -O "$file" ]] || return 1
+  IFS= read -r value < "$file"
+  [[ "$value" =~ $pattern ]] || return 1
+  printf '%s' "$value"
+}
+
+NUM_RE='^[0-9]{1,10}$'
+MAC_RE='^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'
+# PipeWire node names: alsa_output.pci-0000_00_1f.3.analog-stereo and the like.
+NODE_RE='^[[:alnum:]][[:alnum:]._:@/+-]{0,255}$'
+
+ensure_dir "$STATE_DIR"
 
 # ---------------------------------------------------------------- primitives
 
-enabled() { [[ -f "$STATE_FILE" ]]; }
+enabled() { [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]]; }
 
 bt() { bluetoothctl "$@" >/dev/null 2>&1; }
 
@@ -106,24 +164,21 @@ stop_mpris() {
 # speaker mode off needs nothing more than unloading it.
 ensure_loopback() {
   local source_node="$1" sink module
-  if [[ -f "$LOOPBACK_FILE" ]]; then
-    module=$(<"$LOOPBACK_FILE")
+  if module=$(state_get "$LOOPBACK_FILE" "$NUM_RE"); then
     pactl list modules short 2>/dev/null | grep -q "^${module}[[:space:]]" && return 0
-    rm -f "$LOOPBACK_FILE"
   fi
+  rm -f "$LOOPBACK_FILE"
   sink=$(default_sink)
   [[ -n "$sink" ]] || return 1
   module=$(pactl load-module module-loopback \
     source="$source_node" sink="$sink" \
     latency_msec=100 source_dont_move=true 2>/dev/null) || return 1
-  [[ -n "$module" ]] && printf '%s\n' "$module" > "$LOOPBACK_FILE"
+  [[ "$module" =~ $NUM_RE ]] && state_put "$LOOPBACK_FILE" "$module"
 }
 
 drop_loopback() {
-  [[ -f "$LOOPBACK_FILE" ]] || return 0
   local module
-  module=$(<"$LOOPBACK_FILE")
-  [[ -n "$module" ]] && pactl unload-module "$module" >/dev/null 2>&1
+  module=$(state_get "$LOOPBACK_FILE" "$NUM_RE") && pactl unload-module "$module" >/dev/null 2>&1
   rm -f "$LOOPBACK_FILE"
 }
 
@@ -136,15 +191,15 @@ TIMEOUT_FILE="$STATE_DIR/discoverable-timeout"
 hold_discoverable() {
   local current
   current=$(bluetoothctl show 2>/dev/null | sed -n 's/.*DiscoverableTimeout: .*(\([0-9]\+\)).*/\1/p' | head -1)
-  if [[ -n "$current" && "$current" != "0" && ! -f "$TIMEOUT_FILE" ]]; then
-    printf '%s\n' "$current" > "$TIMEOUT_FILE"
+  if [[ "$current" =~ $NUM_RE && "$current" != "0" ]] && ! state_get "$TIMEOUT_FILE" "$NUM_RE" >/dev/null; then
+    state_put "$TIMEOUT_FILE" "$current"
   fi
   bt discoverable-timeout 0
 }
 
 release_discoverable() {
-  local previous=180
-  [[ -f "$TIMEOUT_FILE" ]] && previous=$(<"$TIMEOUT_FILE")
+  local previous
+  previous=$(state_get "$TIMEOUT_FILE" "$NUM_RE") || previous=180
   bt discoverable-timeout "$previous"
   rm -f "$TIMEOUT_FILE"
 }
@@ -189,14 +244,14 @@ list_sources() {
       | select((.name | startswith("bluez_")) | not) ]' 2>/dev/null || echo '[]'
 }
 
-mic_get() {
-  [[ -f "$MIC_FILE" ]] && printf '%s' "$(<"$MIC_FILE")"
-}
+mic_get() { state_get "$MIC_FILE" "$NODE_RE"; }
 
 mic_set() {
   local name="${1:-}"
   if [[ -z "$name" || "$name" == "default" ]]; then rm -f "$MIC_FILE"
-  else printf '%s\n' "$name" > "$MIC_FILE"; fi
+  elif [[ "$name" =~ $NODE_RE ]]; then state_put "$MIC_FILE" "$name"
+  else echo "omarchy-speaker-mode: not a capture device name: $name" >&2; return 2
+  fi
   drop_mic_loopback
   enabled && sync_mic
 }
@@ -215,10 +270,8 @@ phone_voice_sink() {
 }
 
 drop_mic_loopback() {
-  [[ -f "$MIC_LOOPBACK_FILE" ]] || return 0
   local module
-  module=$(<"$MIC_LOOPBACK_FILE")
-  [[ -n "$module" ]] && pactl unload-module "$module" >/dev/null 2>&1
+  module=$(state_get "$MIC_LOOPBACK_FILE" "$NUM_RE") && pactl unload-module "$module" >/dev/null 2>&1
   rm -f "$MIC_LOOPBACK_FILE"
 }
 
@@ -232,11 +285,10 @@ sync_mic() {
   sink=$(phone_voice_sink "$mac")
   if [[ -z "$sink" ]]; then drop_mic_loopback; return 0; fi
 
-  if [[ -f "$MIC_LOOPBACK_FILE" ]]; then
-    module=$(<"$MIC_LOOPBACK_FILE")
+  if module=$(state_get "$MIC_LOOPBACK_FILE" "$NUM_RE"); then
     pactl list modules short 2>/dev/null | grep -q "^${module}[[:space:]]" && return 0
-    rm -f "$MIC_LOOPBACK_FILE"
   fi
+  rm -f "$MIC_LOOPBACK_FILE"
 
   source=$(mic_get)
   [[ -n "$source" ]] || source=$(pactl get-default-source 2>/dev/null)
@@ -245,10 +297,10 @@ sync_mic() {
   module=$(pactl load-module module-loopback \
     source="$source" sink="$sink" \
     latency_msec=40 source_dont_move=true sink_dont_move=true 2>/dev/null) || return 1
-  [[ -n "$module" ]] && printf '%s\n' "$module" > "$MIC_LOOPBACK_FILE"
+  [[ "$module" =~ $NUM_RE ]] && state_put "$MIC_LOOPBACK_FILE" "$module"
 }
 
-mic_active() { [[ -f "$MIC_LOOPBACK_FILE" ]]; }
+mic_active() { state_get "$MIC_LOOPBACK_FILE" "$NUM_RE" >/dev/null; }
 
 # Message notifications ride MAP, a standard profile — the same path works on
 # Android. It needs a daemon rather than a one-shot call: obexd destroys a
@@ -289,7 +341,7 @@ list_sinks() {
           | select(.name != "") ]' 2>/dev/null || echo '[]'
 }
 
-output_get() { [[ -f "$OUTPUT_FILE" ]] && printf '%s' "$(<"$OUTPUT_FILE")"; }
+output_get() { state_get "$OUTPUT_FILE" "$NODE_RE"; }
 
 output_set() {
   local name="${1:-}"
@@ -299,9 +351,12 @@ output_set() {
     # or the choice appears to do nothing until the next reconnect. After that
     # the stream is left alone, so moving it by hand elsewhere still sticks.
     enabled && move_phone_stream "$(default_sink)"
-  else
-    printf '%s\n' "$name" > "$OUTPUT_FILE"
+  elif [[ "$name" =~ $NODE_RE ]]; then
+    state_put "$OUTPUT_FILE" "$name"
     enabled && route_output
+  else
+    echo "omarchy-speaker-mode: not an output name: $name" >&2
+    return 2
   fi
 }
 
@@ -328,11 +383,11 @@ route_output() {
 # Notifications are opt-out rather than opt-in: they are part of what speaker
 # mode is for, but they are also the one piece that puts message content on
 # screen, so they get their own switch.
-notifications_enabled() { [[ ! -f "$NOTIFY_FILE" ]]; }
+notifications_enabled() { [[ ! -e "$NOTIFY_FILE" ]]; }
 
 notifications_set() {
   case "${1:-on}" in
-    off|false|0) : > "$NOTIFY_FILE"; stop_notify ;;
+    off|false|0) state_put "$NOTIFY_FILE" ""; stop_notify ;;
     *)           rm -f "$NOTIFY_FILE"; enabled && start_notify "$(connected_phone_mac)" ;;
   esac
 }
@@ -369,8 +424,9 @@ LAST_DEVICE_FILE="$STATE_DIR/last-device"
 
 remember_phone() {
   local mac="${1:-}"
-  [[ -n "$mac" ]] || return 0
-  printf '%s\n' "$mac" > "$LAST_DEVICE_FILE"
+  [[ "$mac" =~ $MAC_RE ]] || return 0
+  [[ "$(state_get "$LAST_DEVICE_FILE" "$MAC_RE")" == "$mac" ]] && return 0
+  state_put "$LAST_DEVICE_FILE" "$mac"
 }
 
 # Paired devices that can play *to* this machine. `devices Paired` lists
@@ -379,7 +435,7 @@ remember_phone() {
 paired_phones() {
   local mac
   while read -r _ mac _; do
-    [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || continue
+    [[ "$mac" =~ $MAC_RE ]] || continue
     bluetoothctl info "$mac" 2>/dev/null | grep -q "Audio Source" && printf '%s\n' "$mac"
   done < <(bluetoothctl devices Paired 2>/dev/null)
 }
@@ -389,12 +445,9 @@ paired_phones() {
 # answer, so nothing is picked.
 remembered_phone() {
   local mac
-  if [[ -f "$LAST_DEVICE_FILE" ]]; then
-    mac=$(<"$LAST_DEVICE_FILE")
-    if [[ -n "$mac" ]] && paired_phones | grep -qx "$mac"; then
-      printf '%s' "$mac"
-      return 0
-    fi
+  if mac=$(state_get "$LAST_DEVICE_FILE" "$MAC_RE") && paired_phones | grep -qx "$mac"; then
+    printf '%s' "$mac"
+    return 0
   fi
   local -a candidates
   mapfile -t candidates < <(paired_phones)
@@ -513,12 +566,20 @@ Speaker mode removed.
   Daemons stopped     media keys, notifications and volume mirroring
   Deleted             saved settings and cached cover art
 
-Two things were installed system-wide for cover art and are left alone, since
-other software may rely on them. Remove them by hand if you want:
+The two system-wide setup steps for cover art are left alone, since other
+software may rely on them. Undo them by hand only if you did them for this
+plugin:
 
-  sudo pacman -R bluez-obex
-  sudo sed -i 's/^Experimental = true/#Experimental = false/' /etc/bluetooth/main.conf
-  sudo systemctl restart bluetooth
+  If you installed bluez-obex for it and nothing else needs the package:
+    sudo pacman -R bluez-obex
+
+  If you edited /etc/bluetooth/main.conf for it, put back the copy you made
+  before editing, then restart Bluetooth:
+    sudo cp /etc/bluetooth/main.conf.speaker-mode.bak /etc/bluetooth/main.conf
+    sudo systemctl restart bluetooth
+
+  Without a copy, set Experimental back to what it was by hand — leave it
+  alone if it was already true before this plugin.
 EOF
 }
 
@@ -684,6 +745,16 @@ status_json() {
 ART_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-speaker-mode/art"
 BIP_UUID="0000111A-0000-1000-8000-00805f9b34fb"
 
+# What the phone sends is not trusted just because the phone is paired. A
+# transfer is stopped the moment it grows past ART_MAX_BYTES, the file is
+# accepted only if its header says JPEG or PNG within ART_MAX_SIDE on each
+# axis, and the cache keeps the newest ART_KEEP files. Real cover art is a
+# 200–300 pixel JPEG of a few tens of kilobytes; none of these limits is
+# anywhere near it.
+ART_MAX_BYTES=$((4 * 1024 * 1024))
+ART_MAX_SIDE=2048
+ART_KEEP=64
+
 avrcp_player() {
   local mac="${1:-}"
   [[ -n "$mac" ]] || return 1
@@ -732,19 +803,129 @@ ensure_bip_session() {
   printf '%s' "$out" | grep -o "/org/bluez/obex/client/session[0-9]*"
 }
 
+transfer_prop() {
+  busctl --user --json=short get-property org.bluez.obex "$1" org.bluez.obex.Transfer1 "$2" 2>/dev/null \
+    | jq -r '.data // empty' 2>/dev/null
+}
+
 # Transfers are asynchronous: the call returns a queued object, the file lands
-# later. Wait on the transfer's own status rather than guessing at the file.
+# later. Wait on the transfer's own status rather than guessing at the file,
+# and watch its size on the way: `Size` is what the phone announces up front,
+# `Transferred` what has actually arrived. Either past the cap ends it.
 await_transfer() {
-  local transfer="${1:-}" status
+  local transfer="${1:-}" status size done
   for _ in $(seq 1 40); do
-    status=$(busctl --user get-property org.bluez.obex "$transfer" org.bluez.obex.Transfer1 Status 2>/dev/null | sed 's/^s //; s/"//g')
+    status=$(transfer_prop "$transfer" Status)
     case "$status" in
       complete) return 0 ;;
       error)    return 1 ;;
       "")       return 0 ;;   # object already gone: finished and cleaned up
     esac
+    size=$(transfer_prop "$transfer" Size)
+    done=$(transfer_prop "$transfer" Transferred)
+    if [[ "$size" =~ $NUM_RE && size -gt ART_MAX_BYTES ]] \
+       || [[ "$done" =~ $NUM_RE && done -gt ART_MAX_BYTES ]]; then
+      return 1
+    fi
     sleep 0.25
   done
+  return 1
+}
+
+# Width and height from the header alone — nothing is decoded here. JPEG keeps
+# them in the first SOF marker, PNG in the IHDR chunk that always comes first.
+image_dimensions() {
+  python3 - "$1" <<'PY'
+import struct, sys
+SOF = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+with open(sys.argv[1], "rb") as f:
+    head = f.read(8)
+    if head == b"\x89PNG\r\n\x1a\n":
+        f.seek(12)
+        if f.read(4) == b"IHDR":
+            w, h = struct.unpack(">II", f.read(8))
+            print(f"{w}x{h}")
+            sys.exit(0)
+        sys.exit(1)
+    if head[:3] != b"\xff\xd8\xff":
+        sys.exit(1)
+    f.seek(2)
+    while True:
+        b = f.read(1)
+        if b != b"\xff":
+            break
+        m = f.read(1)
+        while m == b"\xff":
+            m = f.read(1)
+        if not m:
+            break
+        m = m[0]
+        if m == 0xD8 or 0xD0 <= m <= 0xD7 or m == 0x01:
+            continue
+        if m == 0xD9 or m == 0xDA:
+            break
+        (length,) = struct.unpack(">H", f.read(2))
+        if m in SOF:
+            _, h, w = struct.unpack(">BHH", f.read(5))
+            print(f"{w}x{h}")
+            sys.exit(0)
+        f.seek(length - 2, 1)
+sys.exit(1)
+PY
+}
+
+# A plain file of ours, under the byte cap, a JPEG or PNG by its header, and
+# within the pixel cap on both axes.
+valid_image() {
+  local file="$1" size dims w h
+  [[ -f "$file" && ! -L "$file" && -O "$file" && -s "$file" ]] || return 1
+  size=$(stat -c %s "$file" 2>/dev/null) || return 1
+  (( size <= ART_MAX_BYTES )) || return 1
+  dims=$(image_dimensions "$file") || return 1
+  [[ "$dims" =~ ^([0-9]+)x([0-9]+)$ ]] || return 1
+  w=${BASH_REMATCH[1]}; h=${BASH_REMATCH[2]}
+  (( w >= 1 && h >= 1 && w <= ART_MAX_SIDE && h <= ART_MAX_SIDE ))
+}
+
+# Past ART_KEEP files the oldest go, and scratch directories a killed fetch
+# left behind go with them.
+trim_art_cache() {
+  find "$ART_DIR" -maxdepth 1 -type f -name '*.jpg' -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -rn | tail -n +"$((ART_KEEP + 1))" | cut -f2- | xargs -r -d '\n' rm -f --
+  find "$ART_DIR" -maxdepth 1 -type d -name '.incoming.*' -mmin +10 -exec rm -rf {} + 2>/dev/null
+}
+
+# A cached file counts only if it is a real file of ours with something in it.
+cached_art() { [[ -f "$1" && ! -L "$1" && -O "$1" && -s "$1" ]]; }
+
+# Have obexd deliver into a private scratch directory, watch the transfer, and
+# publish the file only once it has passed every check. The final rename is
+# atomic, so another panel instance fetching the same album sees either
+# nothing yet or a whole file — never a half-written one — and a symlink left
+# at the cache path is replaced rather than written through.
+#
+#   receive_image SESSION DEST METHOD SIGNATURE ARGS…
+#
+# The destination path is the first argument of both Image1 methods; ARGS are
+# the rest, in order.
+receive_image() {
+  local session="$1" dest="$2" method="$3" signature="$4"; shift 4
+  local scratch tmp transfer
+  scratch=$(mktemp -d "$ART_DIR/.incoming.XXXXXX") || return 1
+  tmp="$scratch/image"
+  transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
+               "$method" "$signature" "$tmp" "$@" 2>/dev/null \
+             | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
+  if [[ -n "$transfer" ]] && await_transfer "$transfer" && valid_image "$tmp"; then
+    sync "$tmp" 2>/dev/null
+    if mv -f "$tmp" "$dest"; then
+      rm -rf "$scratch"
+      trim_art_cache
+      return 0
+    fi
+  fi
+  [[ -n "$transfer" ]] && busctl --user call org.bluez.obex "$transfer" org.bluez.obex.Transfer1 Cancel >/dev/null 2>&1
+  rm -rf "$scratch"
   return 1
 }
 
@@ -763,7 +944,7 @@ artwork() {
   # session handing out fresh handles does not refetch what we already have.
   artist=$(track_field "$player" Artist)
   album=$(track_field "$player" Album)
-  mkdir -p "$ART_DIR"
+  ensure_dir "$ART_DIR"
   # Spotify varies the artist it sends ("The Script" vs "The Script • Video
   # Available"), which would split one album across two cache entries and pull
   # the same image over the air twice. Key on the part before the bullet, with
@@ -772,23 +953,14 @@ artwork() {
   subject="${subject%"${subject##*[![:space:]]}"}"
   key=$(printf '%s|%s' "$subject" "$album" | sha1sum | cut -d' ' -f1)
   path="$ART_DIR/$key.jpg"
-  [[ -s "$path" ]] && { printf '%s\n' "$path"; return 0; }
+  cached_art "$path" && { printf '%s\n' "$path"; return 0; }
 
-  local session transfer
+  local session
   session=$(ensure_bip_session "$mac" "$player") || return 1
   [[ -n "$session" ]] || return 1
 
-  transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
-               GetThumbnail ss "$path" "$handle" 2>/dev/null \
-             | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
-  [[ -n "$transfer" ]] || { rm -f "$path"; return 1; }
-
-  if await_transfer "$transfer" && [[ -s "$path" ]]; then
-    printf '%s\n' "$path"
-    return 0
-  fi
-  rm -f "$path"
-  return 1
+  receive_image "$session" "$path" GetThumbnail ss "$handle" || return 1
+  printf '%s\n' "$path"
 }
 
 
@@ -801,20 +973,25 @@ artwork() {
 # descriptor rather than accepting the default.
 #
 # Sizes that are not advertised are ignored and silently answered with native,
-# so there is no point guessing at larger ones.
+# so there is no point guessing at larger ones. Only fixed-size JPEG variants
+# within the pixel cap are considered: JPEG is what the cache and the saved
+# file are named for, and anything larger would be refused on arrival anyway.
 best_variant() {
   local session="${1:-}" handle="${2:-}"
   [[ -n "$session" && -n "$handle" ]] || return 1
   busctl --user --json=short call org.bluez.obex "$session" org.bluez.obex.Image1 \
       Properties s "$handle" 2>/dev/null \
-    | jq -r '[ .data[0][]
-               | select(.pixel)
-               | { pixel: .pixel.data,
-                   encoding: (.encoding.data // "JPEG"),
-                   area: ((.pixel.data | split("*") | .[0] | tonumber)
-                          * (.pixel.data | split("*") | .[1] | tonumber)) } ]
-             | sort_by(.area) | last
-             | if . then "\(.pixel)\t\(.encoding)" else empty end' 2>/dev/null
+    | jq -r --argjson side "$ART_MAX_SIDE" '
+        [ .data[0][]
+          | select(.pixel and (.pixel.data | test("^[0-9]+\\*[0-9]+$")))
+          | select(((.encoding.data // "JPEG") | ascii_upcase) == "JPEG")
+          | { pixel: .pixel.data,
+              w: (.pixel.data | split("*") | .[0] | tonumber),
+              h: (.pixel.data | split("*") | .[1] | tonumber) }
+          | select(.w <= $side and .h <= $side)
+          | . + { area: (.w * .h) } ]
+        | sort_by(.area) | last
+        | if . then .pixel else empty end' 2>/dev/null
 }
 # The row shows a 200x200 thumbnail, which is all GetThumbnail returns. The
 # expanded view needs the real thing, so pull the full image on demand with
@@ -824,7 +1001,7 @@ artwork_full() {
   local mac="${1:-}"
   [[ -n "$mac" ]] || return 1
 
-  local player handle artist album subject key path thumb session transfer
+  local player handle artist album subject key path thumb session
   player=$(avrcp_player "$mac") || return 1
   handle=$(track_field "$player" ImgHandle)
   [[ -n "$handle" ]] || return 1
@@ -833,34 +1010,22 @@ artwork_full() {
   album=$(track_field "$player" Album)
   subject="${artist%%•*}"
   subject="${subject%"${subject##*[![:space:]]}"}"
-  mkdir -p "$ART_DIR"
+  ensure_dir "$ART_DIR"
   key=$(printf '%s|%s' "$subject" "$album" | sha1sum | cut -d' ' -f1)
   path="$ART_DIR/$key-full.jpg"
-  [[ -s "$path" ]] && { printf '%s\n' "$path"; return 0; }
+  cached_art "$path" && { printf '%s\n' "$path"; return 0; }
 
   session=$(ensure_bip_session "$mac" "$player") || return 1
 
-  local best pixel encoding
-  best=$(best_variant "$session" "$handle")
-  pixel=$(cut -f1 <<<"$best")
-  encoding=$(cut -f2 <<<"$best")
+  local pixel
+  pixel=$(best_variant "$session" "$handle")
 
   if [[ -n "$pixel" ]]; then
-    transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
-                 Get "ssa{sv}" "$path" "$handle" 2 pixel s "$pixel" encoding s "${encoding:-JPEG}" 2>/dev/null \
-               | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
+    receive_image "$session" "$path" Get "ssa{sv}" "$handle" 2 pixel s "$pixel" encoding s JPEG
   else
-    transfer=$(busctl --user call org.bluez.obex "$session" org.bluez.obex.Image1 \
-                 Get "ssa{sv}" "$path" "$handle" 0 2>/dev/null \
-               | grep -o "/org/bluez/obex/client/session[0-9]*/transfer[0-9]*" | head -1)
-  fi
+    receive_image "$session" "$path" Get "ssa{sv}" "$handle" 0
+  fi && { printf '%s\n' "$path"; return 0; }
 
-  if [[ -n "$transfer" ]] && await_transfer "$transfer" && [[ -s "$path" ]]; then
-    printf '%s\n' "$path"
-    return 0
-  fi
-
-  rm -f "$path"
   # No full-size variant: the thumbnail is better than nothing.
   thumb=$(artwork "$mac") && { printf '%s\n' "$thumb"; return 0; }
   return 1
@@ -884,9 +1049,13 @@ artwork_save() {
 
   mkdir -p "$dest"
   name="${artist:-Unknown} - ${album:-Cover}"
-  # Keep the filename portable: no slashes, no leading dots.
+  # The name comes from the phone. Keep it a portable filename: no control
+  # characters, no slashes, no leading dots, and short enough for any
+  # filesystem.
+  name=$(printf '%s' "$name" | tr -d '\000-\037\177' | cut -c1-120)
   name=${name//\//-}
   name=${name#.}
+  [[ -n "$name" ]] || name="Cover"
   cp -f "$src" "$dest/$name.jpg" 2>/dev/null || return 1
   chmod 644 "$dest/$name.jpg" 2>/dev/null
   printf '%s\n' "$dest/$name.jpg"
@@ -900,10 +1069,10 @@ drop_bip_session() {
 # --------------------------------------------------------------------- main
 
 case "${1:-status}" in
-  on)     : > "$STATE_FILE"; apply_on; try_connect_remembered ;;
+  on)     state_put "$STATE_FILE" ""; apply_on; try_connect_remembered ;;
   off)    rm -f "$STATE_FILE"; apply_off ;;
   toggle) if enabled; then rm -f "$STATE_FILE"; apply_off
-          else : > "$STATE_FILE"; apply_on; try_connect_remembered; fi ;;
+          else state_put "$STATE_FILE" ""; apply_on; try_connect_remembered; fi ;;
   sync)   if enabled; then apply_on; else enforce_off; fi ;;
   status) status_json ;;
   uninstall) uninstall ;;

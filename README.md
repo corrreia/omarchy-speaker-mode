@@ -36,8 +36,14 @@ Everything below ships with Omarchy except the first two, which are needed for
 cover art. Without them the plugin works fine and simply shows a placeholder
 instead of artwork.
 
+Both are system-wide changes you make by hand, and both are yours to undo, so
+keep a copy of the Bluetooth config before touching it. Skip a step that is
+already in place: if `bluez-obex` is installed or `Experimental = true` is
+already set, leave it as it is and note that it was not this plugin that did it.
+
 ```bash
-sudo pacman -S bluez-obex
+sudo pacman -S --needed bluez-obex
+sudo cp -n /etc/bluetooth/main.conf /etc/bluetooth/main.conf.speaker-mode.bak
 sudo sed -i 's/^#\?Experimental = false/Experimental = true/' /etc/bluetooth/main.conf
 sudo systemctl restart bluetooth
 systemctl --user enable --now obex
@@ -46,8 +52,8 @@ systemctl --user enable --now obex
 `bluez-obex` provides the OBEX daemon that fetches cover art, and
 `Experimental = true` is what makes BlueZ publish the image handle the phone
 sends. Also required, and already present on a stock install: `bluez`,
-`bluez-utils`, `pipewire`, `pipewire-pulse`, `wireplumber`, `jq`, and
-`python-gobject`.
+`bluez-utils`, `pipewire`, `pipewire-pulse`, `wireplumber`, `jq`, `python`,
+and `python-gobject`.
 
 For message notifications, the phone has to grant notification access. iOS asks
 once, per device: Settings → Bluetooth → ⓘ next to this machine → allow
@@ -79,13 +85,25 @@ Requirements, which you run yourself.
 **Network.** None. Cover art comes from the phone over Bluetooth, not from the
 internet, and nothing is uploaded or reported anywhere.
 
+**What it accepts from the phone.** A paired phone is not trusted just because
+it is paired. Cover art is received into a private scratch file, stopped if it
+grows past 4 MB, accepted only if its header says JPEG or PNG of at most
+2048 pixels a side, and only then moved into the cache, which keeps the newest
+64 files. The widget decodes it at a bounded size on top of that. Track titles
+and message text are rendered as plain text and message text is trimmed to
+notification length. Every command the widget runs has a deadline, and every
+command the helper runs on BlueZ, obexd or PipeWire has one too, so a stalled
+daemon cannot leave a process behind.
+
 **What it reads and writes.** It reads the connected phone's media metadata,
 cover art, battery level, and — when notifications are enabled — incoming
 message senders and subjects, which are passed to your desktop notification
 daemon and never logged or stored. It writes settings to
 `$XDG_STATE_HOME/omarchy-speaker-mode` and cached cover art to
-`$XDG_CACHE_HOME/omarchy-speaker-mode`, and saves a cover to your Pictures
-folder only when you click the save button.
+`$XDG_CACHE_HOME/omarchy-speaker-mode`, both private directories it creates
+itself, and saves a cover to your Pictures folder only when you click the save
+button. Settings are written by atomic replace and checked against the shape
+they were written in when read back.
 
 **What it changes on your system, all at runtime and all reversed on `off`.**
 Adapter discoverability and its timeout, the connected phone's PipeWire card
@@ -179,6 +197,19 @@ The uninstall step restores Bluetooth, stops the background services, and
 deletes saved settings and cached artwork. If you forget it, the services stop
 by themselves within a minute of the directory disappearing, but Bluetooth is
 left as it was.
+
+The two system-wide setup steps for cover art are not undone for you, since
+other software may rely on them. If you made them for this plugin, undo them
+yourself: remove `bluez-obex` only if you installed it here and nothing else
+needs it, and put the Bluetooth config back from the copy you kept:
+
+```bash
+sudo pacman -R bluez-obex
+sudo cp /etc/bluetooth/main.conf.speaker-mode.bak /etc/bluetooth/main.conf
+sudo systemctl restart bluetooth
+```
+
+If `Experimental = true` was already set before this plugin, leave it alone.
 
 ## Command line
 

@@ -208,7 +208,7 @@ Panel {
     teardownProc.running = true
   }
 
-  Process { id: teardownProc }
+  HelperProcess { id: teardownProc }
 
   Service {
     id: speaker
@@ -218,59 +218,63 @@ Panel {
   }
 
 
+  // The helper prints one path, on its own line, once the file is complete and
+  // has passed its checks. Anything else is not a path.
+  function artPathFrom(text) {
+    var path = String(text || "").trim()
+    return path.indexOf("/") === 0 && path.indexOf("\n") === -1 ? path : ""
+  }
+
+  // A fetch is a session to the phone plus up to ten seconds waiting on the
+  // transfer, so the art processes get a little longer than the default.
+  //
   // A failed fetch is usually the phone not having opened its imaging
   // responder yet rather than a permanent no, so give it one more go before
   // settling on the placeholder.
-  Process {
+  HelperProcess {
     id: artProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var path = String(text || "").trim()
-        if (path !== "") root.artPath = path
-      }
+    deadlineMs: 30000
+    onCollected: function(text) {
+      var path = root.artPathFrom(text)
+      if (path !== "") root.artPath = path
     }
     onExited: function(exitCode) {
       if (exitCode !== 0 && root.artPath === "" && root.artKey !== "||") artRetry.restart()
     }
   }
 
-
-  Process {
+  HelperProcess {
     id: artFullProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var path = String(text || "").trim()
-        if (path !== "") root.artFullPath = path
-      }
+    deadlineMs: 30000
+    onCollected: function(text) {
+      var path = root.artPathFrom(text)
+      if (path !== "") root.artFullPath = path
     }
   }
 
   // Saving is a deliberate, one-off action, so it says so out loud rather than
   // leaving the user to guess where the file went.
-  Process {
+  HelperProcess {
     id: artSaveProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var path = String(text || "").trim()
-        if (path !== "") root.artSavedTo = path
-      }
+    deadlineMs: 30000
+    onCollected: function(text) {
+      var path = root.artPathFrom(text)
+      if (path !== "") root.artSavedTo = path
     }
     onExited: function(exitCode) {
+      if (notifyProc.running) return
       if (exitCode === 0 && root.artSavedTo !== "") {
-        notifyProc.command = ["notify-send", "-i", root.artSavedTo,
+        notifyProc.command = ["notify-send", "-i", root.artSavedTo, "--",
                               "Cover saved", root.artSavedTo]
       } else {
-        notifyProc.command = ["notify-send", "-u", "critical",
+        notifyProc.command = ["notify-send", "-u", "critical", "--",
                               "Speaker Mode", "Could not save the cover"]
       }
       notifyProc.running = true
     }
   }
 
-  Process { id: notifyProc }
+  HelperProcess { id: notifyProc; deadlineMs: 10000 }
   Timer {
     id: artRetry
     interval: 2500
@@ -648,6 +652,10 @@ Panel {
                       anchors.margins: Style.space(2)
                       fillMode: Image.PreserveAspectCrop
                       asynchronous: true
+                      // The decode is bounded here as well as by the helper's
+                      // checks: whatever the file claims, no more than this
+                      // many pixels are ever allocated for it.
+                      sourceSize: Qt.size(512, 512)
                       source: root.coverSource
                       visible: source !== "" && status === Image.Ready
                     }
@@ -784,6 +792,7 @@ Panel {
                     // and mipmap keep that from looking like a mosaic.
                     smooth: true
                     mipmap: true
+                    sourceSize: Qt.size(1024, 1024)
                     source: root.coverSource
                     visible: source !== "" && status === Image.Ready
                   }

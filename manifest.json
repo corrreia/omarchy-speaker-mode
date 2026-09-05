@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.corrreia.speaker",
   "name": "Speaker Mode",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "correia",
   "license": "MIT",
   "description": "Turn this machine into a Bluetooth speaker for your phone, with on/off state in the bar.",
