@@ -145,8 +145,11 @@ mpris_active() { systemctl --user is-active --quiet "$MPRIS_UNIT"; }
 
 start_mpris() {
   mpris_active && return 0
+  # BlueZ 5.87 passes a null iterator when Track is invalidated. Make libdbus
+  # return DBUS_TYPE_INVALID instead of aborting until mpris-proxy checks it.
   # --collect so a crashed run does not leave a failed unit behind.
   systemd-run --user --unit="$MPRIS_UNIT" --collect --quiet \
+    --setenv=DBUS_FATAL_WARNINGS=0 \
     --description="Bluetooth AVRCP to MPRIS bridge (Omarchy speaker mode)" \
     mpris-proxy >/dev/null 2>&1
 }
