@@ -18,6 +18,7 @@ Item {
   }
 
   property bool enabled: false
+  property bool rolesBlocked: false
   property bool connected: false
   property bool streaming: false
   property bool discoverable: false
@@ -48,7 +49,8 @@ Item {
   signal settled()
 
   readonly property var state: ({
-    enabled: enabled, connected: connected, streaming: streaming,
+    enabled: enabled, rolesBlocked: rolesBlocked,
+    connected: connected, streaming: streaming,
     discoverable: discoverable, mprisProxy: mprisProxy, battery: battery,
     device: device, mac: mac, card: card, profile: profile, sink: sink,
     sinkDescription: sinkDescription,
@@ -83,6 +85,7 @@ Item {
   function applyStatus(raw) {
     var next = Model.parseStatus(raw)
     enabled = next.enabled
+    rolesBlocked = next.rolesBlocked
     connected = next.connected
     streaming = next.streaming
     discoverable = next.discoverable

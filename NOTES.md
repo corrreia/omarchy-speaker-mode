@@ -76,7 +76,7 @@ purpose.
 Symptom worth recognising if anyone tries again: **SMS keeps working, app
 notifications do not.**
 
-## `off` has to be held, not applied once
+## `off` means withdrawing the speaker roles
 
 Setting the phone's card profile to `off` releases the local audio node but
 leaves the AVDTP link standing, so the phone goes on believing it is playing to
@@ -85,18 +85,40 @@ Source** UUID (`0000110a`) is what actually ends it: the `bluez_card`
 disappears while `bluetoothctl info` still reports `Connected: yes` — which is
 exactly the plain Bluetooth device the plugin promises to hand back.
 
-Doing it once is not enough. The phone can re-establish A2DP whenever it likes
-and BlueZ will accept it, and a `bluez5.auto-connect = [a2dp_sink a2dp_source]`
-rule in a WirePlumber drop-in makes that automatic. So `sync` calls
-`enforce_off` while the switch is off, and `Model.needsSync` reports drift for a
-card that has reappeared with a profile other than `off`.
+That ends one session and no more. The adapter still advertises **Audio Sink**
+(`0000110b`) and **Handsfree** (`0000111e`), so the phone keeps listing this
+machine as a speaker and reconnects whenever it likes, and a
+`bluez5.auto-connect = [a2dp_sink a2dp_source]` rule in a WirePlumber drop-in
+makes WirePlumber pull the link up itself. An earlier version held `off` by
+disconnecting again on every poll. The phone still got through between polls,
+and with the widget not loaded nothing held it at all.
 
-What none of this can do is hide the machine from the phone's speaker list. The
-adapter advertises **Audio Sink** (`0000110b`) permanently — WirePlumber
-registers the role when its bluez monitor loads, per adapter, not per device —
-so a paired phone will always offer this machine as an output. Removing it
-means dropping `a2dp_sink` from `bluez5.roles` and restarting WirePlumber: a
-config rewrite and a daemon restart, and this plugin does neither.
+Those UUIDs are WirePlumber's: it registers the roles when its bluez monitor
+loads, per adapter, not per device. So `off` writes a drop-in setting
+`bluez5.roles` to the defaults minus `a2dp_sink`, `bap_sink` and `hfp_hf`, and
+restarts WirePlumber; `on` deletes it and restarts again. Verified: within a
+second of the restart both UUIDs leave `bluetoothctl show`, the phone stays
+`Connected: yes` with no `bluez_card`, and nothing comes back — auto-connect
+rule included. Removing the drop-in brings the card back in about 3s.
+
+`enforce_off` still disconnects any audio link, for the session in progress when
+the switch is thrown. `Model.needsSync` reports drift while off if the drop-in
+has gone missing, and while on if it is still there.
+
+The restart on `on` means the phone's card comes back a few seconds *after*
+`apply_on` has run, and the volume and notification bridges both need its MAC —
+so the first sync starts neither. `needsSync` therefore treats a connected
+phone with no volume bridge as drift. It deliberately does not watch the
+notification bridge: that one exits when the phone refuses MAP, and watching it
+would respawn it every poll.
+
+## Disabling the plugin
+
+Teardown cannot tell a disable from a shell restart or reload — the widget is
+destroyed either way. So `unloaded` stops the daemons at once and leaves a
+detached child to ask `omarchy-shell shell listPlugins` a few seconds later.
+Still enabled means a restart, and nothing changes. Disabled means off. An
+unreachable shell (a logout) means nothing changes either.
 
 ## Which phone to reconnect to
 

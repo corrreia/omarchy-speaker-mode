@@ -200,11 +200,12 @@ Panel {
   // Unloading the plugin — disabled, removed, or the shell restarting — should
   // not leave background services running against it. `omarchy plugin remove`
   // deletes the directory and runs nothing, so this is the only hook there is.
-  // It stops the daemons only: speaker mode's own state is left alone, so a
-  // shell restart brings them straight back on the next sync.
+  // The helper stops the daemons at once, then waits for the shell to settle
+  // and switches speaker mode off only if the plugin came back disabled: a
+  // shell restart finds it still enabled and picks up on the next sync.
   Component.onDestruction: {
     if (root.helper === "") return
-    teardownProc.command = [root.helper, "stop-daemons"]
+    teardownProc.command = [root.helper, "unloaded"]
     teardownProc.running = true
   }
 

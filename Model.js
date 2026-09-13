@@ -115,10 +115,12 @@ function parseStatus(raw) {
   try { data = JSON.parse(String(raw || "{}")) || {} } catch (e) { data = {} }
   return {
     enabled: data.enabled === true,
+    rolesBlocked: data.rolesBlocked === true,
     connected: data.connected === true,
     streaming: data.streaming === true,
     discoverable: data.discoverable === true,
     mprisProxy: data.mprisProxy === true,
+    volumeSync: data.volumeSync === true,
     battery: typeof data.battery === "number" ? data.battery : -1,
     device: String(data.device || ""),
     mac: String(data.mac || ""),
@@ -138,13 +140,21 @@ function parseStatus(raw) {
 // discoverability that lapsed. The service reacts by running the helper's
 // `sync`.
 //
-// "Off" needs watching as much as "on" does: the phone can re-establish its
-// audio profile at any time and BlueZ will accept it, so a card that has come
-// back to life while the switch is off is drift too.
+// "Off" needs watching as much as "on" does. What keeps a phone away is the
+// drop-in that withdraws the speaker roles, so one that has gone missing is
+// drift, and so is a card that came back to life regardless. On, the drop-in
+// still being there means the phone has nothing to connect to.
 function needsSync(state) {
-  if (!state.enabled) return state.card !== "" && state.profile !== "off"
+  if (!state.enabled) return !state.rolesBlocked || (state.card !== "" && state.profile !== "off")
+  if (state.rolesBlocked) return true
   if (!state.discoverable) return true
   if (!state.mprisProxy) return true
   if (state.card !== "" && state.profile !== "audio-gateway") return true
+  // The daemons need the phone's MAC, so a sync that ran before its card came
+  // up — every `on`, since that restarts WirePlumber — started neither. Only
+  // the volume bridge is watched: it runs until stopped, whereas the
+  // notification bridge exits when the phone refuses MAP and would be
+  // respawned every poll. The sync this triggers starts both.
+  if (state.connected && !state.volumeSync) return true
   return false
 }

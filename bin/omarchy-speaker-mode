@@ -3,8 +3,10 @@
 #
 # The phone talks A2DP *source*, this machine takes the *sink* role, and the
 # incoming stream lands on whatever PipeWire sink is currently the default.
-# Everything here is runtime state: no daemon restarts, no config files
-# rewritten, so `off` puts Bluetooth back exactly as it was.
+# Nearly everything here is runtime state. The exception is `off`: the only way
+# to stop a phone treating this machine as a speaker is for it not to be one, so
+# while off a WirePlumber drop-in withdraws the speaker roles, and `on` deletes
+# it again. See block_speaker_roles.
 #
 # Scope discipline: only cards that advertise the `audio-gateway` profile are
 # ever touched. That profile is what BlueZ offers for an A2DP *source* device
@@ -470,11 +472,72 @@ try_connect_remembered() {
   disown 2>/dev/null || true
 }
 
+# ------------------------------------------------------------ speaker roles
+
+# Dropping the phone's audio profile ends one session and nothing more. The
+# adapter goes on advertising Audio Sink and Handsfree, so the phone keeps
+# listing this machine as a speaker and reconnects whenever it likes — at once,
+# with a `bluez5.auto-connect` rule in WirePlumber — well before a poll can drop
+# it again, and with no poll at all while the widget is not loaded. Those roles
+# are WirePlumber's, registered when its bluez monitor starts, so withdrawing
+# them takes a config drop-in and a WirePlumber restart.
+#
+# The drop-in lists WirePlumber's default roles minus the three that let a
+# device play *to* this machine. What remains is this machine as an audio
+# source, which is all headphones and speakers need.
+WP_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d"
+ROLES_FILE="$WP_CONF_DIR/omarchy-speaker-mode.conf"
+
+speaker_roles_blocked() { [[ -f "$ROLES_FILE" ]]; }
+
+# Wait, briefly, for the adapter to reflect a restart, so what runs next — card
+# profiles on `on`, the status read after `off` — sees the new state.
+await_audio_sink() {
+  local want="$1" uuids
+  for _ in $(seq 1 20); do
+    uuids=$(bluetoothctl show 2>/dev/null)
+    if [[ "$uuids" == *"Audio Sink"* ]]; then [[ "$want" == present ]] && return 0
+    else [[ "$want" == absent ]] && return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+block_speaker_roles() {
+  speaker_roles_blocked && return 0
+  local tmp
+  mkdir -p "$WP_CONF_DIR" || return 1
+  tmp=$(mktemp "$ROLES_FILE.XXXXXX") || return 1
+  if ! cat > "$tmp" <<'EOF'
+## Written by Omarchy speaker mode while it is switched off, and deleted when it
+## is switched on. Without the sink-side roles a phone does not see this machine
+## as a speaker. Headphones and speakers are unaffected.
+monitor.bluez.properties = {
+  bluez5.roles = [ a2dp_source bap_source hfp_ag ]
+}
+EOF
+  then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$ROLES_FILE" || { rm -f "$tmp"; return 1; }
+  systemctl --user try-restart wireplumber >/dev/null 2>&1
+  await_audio_sink absent
+}
+
+unblock_speaker_roles() {
+  speaker_roles_blocked || return 0
+  rm -f "$ROLES_FILE"
+  systemctl --user try-restart wireplumber >/dev/null 2>&1
+  await_audio_sink present
+}
+
 # ------------------------------------------------------------------ actions
 
 # Idempotent: safe to call on every poll. This is what picks up a phone that
 # connects minutes after speaker mode was switched on.
 apply_on() {
+  # First, because nothing below has a phone to act on until WirePlumber
+  # offers the speaker roles again.
+  unblock_speaker_roles
   hold_discoverable
   bt discoverable on
   bt pairable on
@@ -523,9 +586,9 @@ disconnect_audio() {
 }
 
 # The half of `off` that has to stay true for as long as speaker mode is off,
-# rather than being applied once. The phone can re-establish A2DP whenever it
-# likes and BlueZ will accept it — a `bluez5.auto-connect` rule in WirePlumber
-# makes that the default on some setups — so `sync` calls this too.
+# so `sync` calls it too. Withdrawing the speaker roles is what keeps the phone
+# away; dropping any audio link it already holds ends the session in progress
+# cleanly, and catches one that got through regardless.
 enforce_off() {
   local name active
   while IFS=$'\t' read -r name active _; do
@@ -533,6 +596,7 @@ enforce_off() {
     disconnect_audio "$(card_mac "$name")"
   done < <(phone_cards)
   drop_loopback
+  block_speaker_roles
 }
 
 # Full revert to ordinary Bluetooth: the phone stays paired, trusted and
@@ -558,6 +622,9 @@ uninstall() {
   apply_off
   stop_volume
   stop_notify
+  # Off withdraws the speaker roles with a drop-in; leaving it behind would keep
+  # changing WirePlumber after the plugin that explains it is gone.
+  unblock_speaker_roles
   rm -rf "$STATE_DIR"
   rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-speaker-mode"
   cat <<'EOF'
@@ -566,6 +633,8 @@ Speaker mode removed.
   Bluetooth restored  the phone stays paired and connected as an ordinary
                       device, discoverability and its timeout are back to
                       what they were, and its audio profiles are disconnected
+  WirePlumber         back to its default roles, which let a paired phone
+                      use this machine as a speaker again
   Daemons stopped     media keys, notifications and volume mirroring
   Deleted             saved settings and cached cover art
 
@@ -701,12 +770,14 @@ status_json() {
   notifications_enabled && notif_on=true
   output_sink=$(output_get)
 
-  local discoverable=false mpris=false
+  local discoverable=false mpris=false roles_blocked=false
   bluetoothctl show 2>/dev/null | grep -q "Discoverable: yes" && discoverable=true
   mpris_active && mpris=true
+  speaker_roles_blocked && roles_blocked=true
 
   jq -n \
     --argjson enabled "$on" \
+    --argjson rolesBlocked "$roles_blocked" \
     --argjson connected "$connected" \
     --argjson streaming "$streaming" \
     --argjson discoverable "$discoverable" \
@@ -724,7 +795,8 @@ status_json() {
     --arg profile "$active" \
     --arg sink "$(active_sink)" \
     --arg sinkDescription "$(active_sink_description)" \
-    '{ enabled: $enabled, connected: $connected, streaming: $streaming,
+    '{ enabled: $enabled, rolesBlocked: $rolesBlocked,
+       connected: $connected, streaming: $streaming,
        discoverable: $discoverable, mprisProxy: $mprisProxy,
        micActive: $micActive, micSource: $micSource,
        notifications: $notifications,
@@ -1069,6 +1141,44 @@ drop_bip_session() {
   busctl --user call org.bluez.obex /org/bluez/obex org.bluez.obex.Client1 \
     RemoveSession o "$session" >/dev/null 2>&1
 }
+
+# ------------------------------------------------------------------ unload
+
+PLUGIN_ID="io.github.corrreia.speaker"
+
+# The widget calls this as it is torn down, which happens when the plugin is
+# disabled but also when the shell restarts or reloads it. Which of those it was
+# is only knowable afterwards, by asking the shell once it has settled. And the
+# shell kills this process along with the widget, often before a second
+# command has run, so all of it happens in a detached child.
+unloaded() {
+  setsid "${BASH_SOURCE[0]}" unloaded-check </dev/null >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# A disabled plugin means no speaker, the same as the switch being off. A
+# restart or reload leaves the plugin enabled and the new widget carries on
+# where the old one stopped, restarting the daemons on its next sync. With no
+# shell to ask at all — a logout — nothing more is changed.
+unloaded_check() {
+  local plugins
+  stop_volume
+  stop_notify
+  stop_mpris
+  sleep 3
+  for _ in $(seq 1 10); do
+    if plugins=$(deadline omarchy-shell shell listPlugins 2>/dev/null) \
+       && jq -e 'type == "array" and length > 0' <<<"$plugins" >/dev/null 2>&1; then
+      jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id and .enabled == true)' \
+        <<<"$plugins" >/dev/null 2>&1 && return 0
+      rm -f "$STATE_FILE"
+      apply_off
+      return 0
+    fi
+    sleep 3
+  done
+}
+
 # --------------------------------------------------------------------- main
 
 case "${1:-status}" in
@@ -1080,6 +1190,8 @@ case "${1:-status}" in
   status) status_json ;;
   uninstall) uninstall ;;
   stop-daemons) stop_volume; stop_notify; stop_mpris ;;
+  unloaded) unloaded ;;
+  unloaded-check) unloaded_check ;;
   artwork) artwork "${2:-}" ;;
   sources) list_sources ;;
   sinks) list_sinks ;;

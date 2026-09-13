@@ -75,7 +75,14 @@ removed, or by the uninstall command:
 | `omarchy-speaker-volume` | volume mirroring via AVRCP absolute volume |
 
 **Commands it calls.** `bluetoothctl`, `busctl`, `pactl`, `pw-dump`,
-`systemd-run`, `systemctl --user`, `notify-send`, `jq`, and `mpris-proxy`.
+`systemd-run`, `systemctl --user`, `notify-send`, `jq`, `mpris-proxy`, and
+`omarchy-shell`.
+
+**Config it writes.** One WirePlumber drop-in,
+`~/.config/wireplumber/wireplumber.conf.d/omarchy-speaker-mode.conf`, which
+exists only while speaker mode is off. WirePlumber is restarted each time it is
+added or removed, which interrupts desktop audio for a second or so. See
+[What "on" and "off" do](#what-on-and-off-do).
 
 **Privileges.** Nothing runs as root and nothing uses sudo at runtime. It talks
 to BlueZ on the system bus and to obexd and PipeWire on the session bus, all as
@@ -105,12 +112,13 @@ itself, and saves a cover to your Pictures folder only when you click the save
 button. Settings are written by atomic replace and checked against the shape
 they were written in when read back.
 
-**What it changes on your system, all at runtime and all reversed on `off`.**
-Adapter discoverability and its timeout, the connected phone's PipeWire card
-profile, and PipeWire loopbacks for microphone and audio routing. On `off` it
-disconnects the phone's Bluetooth audio profiles; on `on` it may connect to the
-phone it last saw. Pairing, trust and the rest of the Bluetooth link are never
-touched.
+**What it changes on your system.** At runtime, and reversed on `off`: adapter
+discoverability and its timeout, the connected phone's PipeWire card profile,
+and PipeWire loopbacks for microphone and audio routing. On `off` it
+disconnects the phone's Bluetooth audio profiles and withdraws this machine's
+speaker roles through the drop-in above; on `on` it puts them back and may
+connect to the phone it last saw. Pairing, trust and the rest of the Bluetooth
+link are never touched.
 
 ## Install
 
@@ -156,17 +164,20 @@ saw, so the usual case is that you flip the switch and the phone is simply
 there. One attempt, not a retry loop — if the phone was asleep or out of range,
 connect it from the phone as before.
 
-Turning it **off** hands everything back. It disconnects the phone's audio
-profiles, so the phone stops treating this machine as a speaker and its audio
-returns to its own output. The phone stays paired, trusted and connected as an
-ordinary Bluetooth device. Discoverability and its timeout return to what they
-were, and nothing is left running.
+Turning it **off** means this machine is not a speaker. It disconnects the
+phone's audio profiles and tells WirePlumber to stop offering the speaker
+roles (Audio Sink and Handsfree), so the phone's audio returns to its own
+output and the phone has nothing here to reconnect to. The phone stays paired,
+trusted and connected as an ordinary Bluetooth device. Discoverability and its
+timeout return to what they were, and nothing is left running.
 
-Off is then held rather than applied once: a phone is free to re-establish its
-audio profile at any time, and the plugin drops it again within a poll. What it
-cannot do is remove this machine from the phone's list of available speakers —
-the adapter advertises the Bluetooth audio-sink role permanently, and that
-belongs to WirePlumber rather than to this plugin.
+Off does not depend on the widget. It lasts through a shell restart, a reboot,
+and the plugin being disabled, because what enforces it is WirePlumber's own
+config rather than a poll. Headphones and speakers you connect to this machine
+are unaffected: they use the roles that are left.
+
+**Disabling the plugin** switches speaker mode off as well. A shell restart
+does not.
 
 ## Notes on what you'll see
 
@@ -193,10 +204,17 @@ directory and nothing else:
 omarchy plugin remove io.github.corrreia.speaker
 ```
 
-The uninstall step restores Bluetooth, stops the background services, and
-deletes saved settings and cached artwork. If you forget it, the services stop
-by themselves within a minute of the directory disappearing, but Bluetooth is
-left as it was.
+The uninstall step restores Bluetooth, puts WirePlumber back to its default
+roles, stops the background services, and deletes saved settings and cached
+artwork. If you forget it, the services stop by themselves within a minute of
+the directory disappearing, but Bluetooth is left as it was. If speaker mode
+was off, the drop-in stays behind too and phones still cannot use this machine
+as a speaker. Delete it and restart WirePlumber to undo that:
+
+```bash
+rm ~/.config/wireplumber/wireplumber.conf.d/omarchy-speaker-mode.conf
+systemctl --user restart wireplumber
+```
 
 The two system-wide setup steps for cover art are not undone for you, since
 other software may rely on them. If you made them for this plugin, undo them
