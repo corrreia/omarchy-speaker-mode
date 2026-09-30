@@ -158,9 +158,23 @@ disconnects, so MAP cannot be a shell-out the way the artwork fetch is.
 Volume mirroring needs to watch D-Bus and `pactl subscribe` at once. Both run as
 transient user units.
 
-Both are pinned to `/usr/bin/python3`: PyGObject lives in the system
+Both are pinned to `/usr/bin/python3 -I`: PyGObject lives in the system
 interpreter, and `/usr/bin/env python3` picks up a mise shim that does not have
 it.
+
+## Nothing is found on PATH
+
+The session PATH puts mise shims, `~/.cargo/bin` and `~/.local/bin` ahead of
+`/usr/bin`, and the marketplace review treats a tool resolved through it as a
+finding. So `omarchy-speaker-mode` runs as `bash -p`, keeps only the variables
+that locate the session, pins `PATH=/usr/bin` and calls the Bluetooth, audio
+and service tools by absolute path. The transient units start through
+`/usr/bin/env -i` with an explicit session-variable allowlist, rather than
+inheriting the user manager's environment. The Python helpers independently
+validate their `/usr/bin` tools, clear their own environments to the same kind
+of allowlist, and pass it to every child. `Panel.qml` also names
+`/usr/bin/notify-send` directly. A new command goes in the same way, or it
+reopens the review.
 
 ## QML
 

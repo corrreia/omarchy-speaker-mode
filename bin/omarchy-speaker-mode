@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 # omarchy-speaker-mode — make this machine act as a Bluetooth speaker for a phone.
 #
 # The phone talks A2DP *source*, this machine takes the *sink* role, and the
@@ -20,21 +20,91 @@
 set -uo pipefail
 umask 077
 
+# Every program this script starts is a system one, but the PATH it inherits is
+# the session's: mise shims, ~/.cargo/bin and ~/.local/bin all come ahead of
+# /usr/bin, and a name found first in one of those would run in place of the
+# tool meant. Keep only the variables required to find this user's desktop
+# services. `-p` on the shebang also prevents imported functions or BASH_ENV
+# from changing what the script executes.
+while IFS= read -r var; do
+  case "$var" in
+    HOME|USER|LOGNAME) ;;
+    XDG_RUNTIME_DIR|XDG_CONFIG_HOME|XDG_STATE_HOME|XDG_CACHE_HOME) ;;
+    DBUS_SESSION_BUS_ADDRESS|DISPLAY|WAYLAND_DISPLAY) ;;
+    PULSE_SERVER|PIPEWIRE_REMOTE|OMARCHY_SPEAKER_DEADLINE) ;;
+    *) unset "$var" 2>/dev/null ;;
+  esac
+done < <(compgen -e)
+readonly SYS=/usr/bin
+export PATH="$SYS"
+export LC_ALL=C.UTF-8
+readonly PATH LC_ALL
+
+# Resolve every device/service executable once to the exact system location.
+# Refuse a missing, non-executable, or accidentally non-system path before any
+# Bluetooth, audio, or user-service action can run.
+readonly TIMEOUT="$SYS/timeout"
+readonly BLUETOOTHCTL="$SYS/bluetoothctl"
+readonly BUSCTL="$SYS/busctl"
+readonly PACTL="$SYS/pactl"
+readonly PW_DUMP="$SYS/pw-dump"
+readonly SYSTEMCTL="$SYS/systemctl"
+readonly SYSTEMD_RUN="$SYS/systemd-run"
+readonly PYTHON3="$SYS/python3"
+readonly ENV_BIN="$SYS/env"
+readonly READLINK="$SYS/readlink"
+readonly JQ="$SYS/jq"
+readonly SETSID="$SYS/setsid"
+readonly MPRIS_PROXY="$SYS/mpris-proxy"
+readonly OMARCHY_SHELL="$SYS/omarchy-shell"
+readonly -a REQUIRED_TOOLS=(
+  "$TIMEOUT" "$BLUETOOTHCTL" "$BUSCTL" "$PACTL" "$PW_DUMP"
+  "$SYSTEMCTL" "$SYSTEMD_RUN" "$PYTHON3" "$ENV_BIN" "$READLINK" "$JQ"
+  "$SETSID" "$MPRIS_PROXY" "$OMARCHY_SHELL"
+)
+[[ ! -L "$READLINK" && -f "$READLINK" && -x "$READLINK" ]] || {
+  echo "omarchy-speaker-mode: approved system tool is missing or invalid: $READLINK" >&2
+  exit 127
+}
+for tool in "${REQUIRED_TOOLS[@]}"; do
+  resolved=$("$READLINK" -f -- "$tool") || resolved=
+  [[ "$tool" == "$SYS/"* && "$resolved" == "$SYS/"* && -f "$resolved" && -x "$resolved" ]] || {
+    echo "omarchy-speaker-mode: approved system tool is missing or invalid: $tool" >&2
+    exit 127
+  }
+done
+unset tool resolved
+
+# Transient helpers do not inherit the user manager's complete environment.
+# /usr/bin/env receives this allowlist and starts the final executable with it.
+MINIMAL_SESSION_ENV=("HOME=$HOME" "PATH=$SYS" "LC_ALL=$LC_ALL")
+for name in XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS DISPLAY WAYLAND_DISPLAY PULSE_SERVER PIPEWIRE_REMOTE; do
+  [[ -v "$name" ]] && MINIMAL_SESSION_ENV+=("$name=${!name}")
+done
+readonly -a MINIMAL_SESSION_ENV
+unset name
+
 # Everything this script waits on — BlueZ, obexd, PipeWire, systemd — can hang,
 # and the shell widget is waiting on this script in turn. So every one of those
 # commands runs under a deadline, with the whole process group killed if it is
 # not gone a few seconds after the first signal. The names below shadow the
-# real commands for the rest of the file; `command` and `setsid` reach past
-# them where that is wanted.
+# real commands for the rest of the file.
 DEADLINE="${OMARCHY_SPEAKER_DEADLINE:-15}"
-deadline() { command timeout --kill-after=3 "$DEADLINE" "$@"; }
-bluetoothctl() { deadline bluetoothctl "$@"; }
-busctl()       { deadline busctl "$@"; }
-pactl()        { deadline pactl "$@"; }
-pw-dump()      { deadline pw-dump "$@"; }
-systemctl()    { deadline systemctl "$@"; }
-systemd-run()  { deadline systemd-run "$@"; }
-python3()      { deadline python3 "$@"; }
+[[ "$DEADLINE" =~ ^[1-9][0-9]{0,2}$ ]] || {
+  echo "omarchy-speaker-mode: invalid deadline: $DEADLINE" >&2
+  exit 2
+}
+readonly DEADLINE
+deadline()     { "$TIMEOUT" --kill-after=3 "$DEADLINE" "$@"; }
+bluetoothctl() { deadline "$BLUETOOTHCTL" "$@"; }
+busctl()       { deadline "$BUSCTL" "$@"; }
+pactl()        { deadline "$PACTL" "$@"; }
+pw-dump()      { deadline "$PW_DUMP" "$@"; }
+systemctl()    { deadline "$SYSTEMCTL" "$@"; }
+systemd-run()  { deadline "$SYSTEMD_RUN" "$@"; }
+python3()      { deadline "$PYTHON3" -I "$@"; }
+jq()           { "$JQ" "$@"; }
+setsid()       { "$SETSID" "$@"; }
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-speaker-mode"
 STATE_FILE="$STATE_DIR/enabled"
@@ -151,9 +221,9 @@ start_mpris() {
   # return DBUS_TYPE_INVALID instead of aborting until mpris-proxy checks it.
   # --collect so a crashed run does not leave a failed unit behind.
   systemd-run --user --unit="$MPRIS_UNIT" --collect --quiet \
-    --setenv=DBUS_FATAL_WARNINGS=0 \
     --description="Bluetooth AVRCP to MPRIS bridge (Omarchy speaker mode)" \
-    mpris-proxy >/dev/null 2>&1
+    "$ENV_BIN" -i "${MINIMAL_SESSION_ENV[@]}" DBUS_FATAL_WARNINGS=0 \
+    "$MPRIS_PROXY" >/dev/null 2>&1
 }
 
 stop_mpris() {
@@ -323,7 +393,8 @@ start_notify() {
   [[ -x "$NOTIFY_BIN" ]] || return 1
   systemd-run --user --unit="$NOTIFY_UNIT" --collect --quiet \
     --description="Bluetooth MAP message notifications (Omarchy speaker mode)" \
-    "$NOTIFY_BIN" "$mac" >/dev/null 2>&1
+    "$ENV_BIN" -i "${MINIMAL_SESSION_ENV[@]}" \
+    "$PYTHON3" -I "$NOTIFY_BIN" "$mac" >/dev/null 2>&1
 }
 
 stop_notify() {
@@ -412,7 +483,8 @@ start_volume() {
   [[ -x "$VOLUME_BIN" ]] || return 1
   systemd-run --user --unit="$VOLUME_UNIT" --collect --quiet \
     --description="Bluetooth volume mirror (Omarchy speaker mode)" \
-    "$VOLUME_BIN" "$mac" >/dev/null 2>&1
+    "$ENV_BIN" -i "${MINIMAL_SESSION_ENV[@]}" \
+    "$PYTHON3" -I "$VOLUME_BIN" "$mac" >/dev/null 2>&1
 }
 
 stop_volume() {
@@ -468,7 +540,7 @@ try_connect_remembered() {
   [[ -z "$(connected_phone_mac)" ]] || return 0
   mac=$(remembered_phone)
   [[ -n "$mac" ]] || return 0
-  setsid bluetoothctl --timeout 20 connect "$mac" >/dev/null 2>&1 &
+  setsid "$BLUETOOTHCTL" --timeout 20 connect "$mac" >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
 
@@ -1167,7 +1239,7 @@ unloaded_check() {
   stop_mpris
   sleep 3
   for _ in $(seq 1 10); do
-    if plugins=$(deadline omarchy-shell shell listPlugins 2>/dev/null) \
+    if plugins=$(deadline "$OMARCHY_SHELL" shell listPlugins 2>/dev/null) \
        && jq -e 'type == "array" and length > 0' <<<"$plugins" >/dev/null 2>&1; then
       jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id and .enabled == true)' \
         <<<"$plugins" >/dev/null 2>&1 && return 0

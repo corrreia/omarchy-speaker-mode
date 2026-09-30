@@ -1,6 +1,8 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 # Pinned to /usr/bin/python3 deliberately: PyGObject lives in the system
-# interpreter, and a mise shim ahead of it on PATH does not have it.
+# interpreter, and a mise shim ahead of it on PATH does not have it. -I keeps
+# PYTHON* variables and user site-packages from putting other code in front of
+# the system's.
 """Mirror volume between the phone and its stream on this machine.
 
 AVRCP Absolute Volume is already implemented on both sides — BlueZ exposes it
@@ -22,12 +24,42 @@ Usage: omarchy-speaker-volume <device-mac> [--debug]
 """
 
 import json
-import subprocess
 import os
+import subprocess
 import sys
 import time
 
-import gi
+SYSTEM_DIR = "/usr/bin"
+
+
+def approved_system_tool(name):
+    """Return one approved executable path, rejecting missing or redirected tools."""
+    expected = os.path.join(SYSTEM_DIR, name)
+    resolved = os.path.realpath(expected)
+    if (not resolved.startswith(SYSTEM_DIR + os.sep)
+            or not os.path.isfile(resolved)
+            or not os.access(resolved, os.X_OK)):
+        raise SystemExit(
+            f"speaker-volume: approved system tool is missing or invalid: {expected}"
+        )
+    return expected
+
+
+PACTL = approved_system_tool("pactl")
+SESSION_VARS = (
+    "HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "PULSE_SERVER",
+    "PIPEWIRE_REMOTE",
+)
+PROCESS_ENV = {
+    "PATH": SYSTEM_DIR,
+    "LC_ALL": "C.UTF-8",
+    **{name: os.environ[name] for name in SESSION_VARS if name in os.environ},
+}
+# Direct invocation is safe too: Gio and all children see only this allowlist.
+os.environ.clear()
+os.environ.update(PROCESS_ENV)
+
+import gi  # noqa: E402
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
@@ -53,8 +85,9 @@ def log(*a):
 
 def pactl_json(*args):
     try:
-        out = subprocess.run(["pactl", "-f", "json", *args],
-                             capture_output=True, text=True, timeout=5)
+        out = subprocess.run([PACTL, "-f", "json", *args], check=False,
+                             capture_output=True, text=True, timeout=5,
+                             env=PROCESS_ENV)
         return json.loads(out.stdout or "[]")
     except Exception as e:
         log("pactl failed:", e)
@@ -142,8 +175,8 @@ class VolumeBridge:
         s = self.stream()
         if not s:
             return
-        subprocess.run(["pactl", "set-sink-input-volume", str(s["index"]), f"{pct}%"],
-                       check=False, capture_output=True)
+        subprocess.run([PACTL, "set-sink-input-volume", str(s["index"]), f"{pct}%"],
+                       check=False, capture_output=True, env=PROCESS_ENV)
         self.last_applied_pct = pct
         log("-> stream:", f"{pct}%")
 
@@ -208,9 +241,9 @@ class VolumeBridge:
 
         # pactl has no D-Bus surface worth using here; its subscribe stream is
         # the supported way to hear about volume changes as they happen.
-        proc = subprocess.Popen(["pactl", "subscribe"],
+        proc = subprocess.Popen([PACTL, "subscribe"],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, bufsize=1)
+                                text=True, bufsize=1, env=PROCESS_ENV)
         GLib.io_add_watch(proc.stdout, GLib.IO_IN, self.on_pactl_event)
 
         # The transport disappears and returns with the audio link.

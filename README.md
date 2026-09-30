@@ -76,7 +76,9 @@ removed, or by the uninstall command:
 
 **Commands it calls.** `bluetoothctl`, `busctl`, `pactl`, `pw-dump`,
 `systemd-run`, `systemctl --user`, `notify-send`, `jq`, `mpris-proxy`, and
-`omarchy-shell`.
+`omarchy-shell`, all from `/usr/bin` by absolute path. Nothing is looked up on
+your `PATH`, and the helpers run with only the environment variables that
+locate your session.
 
 **Config it writes.** One WirePlumber drop-in,
 `~/.config/wireplumber/wireplumber.conf.d/omarchy-speaker-mode.conf`, which

@@ -265,10 +265,10 @@ Panel {
     onExited: function(exitCode) {
       if (notifyProc.running) return
       if (exitCode === 0 && root.artSavedTo !== "") {
-        notifyProc.command = ["notify-send", "-i", root.artSavedTo, "--",
+        notifyProc.command = ["/usr/bin/notify-send", "-i", root.artSavedTo, "--",
                               "Cover saved", root.artSavedTo]
       } else {
-        notifyProc.command = ["notify-send", "-u", "critical", "--",
+        notifyProc.command = ["/usr/bin/notify-send", "-u", "critical", "--",
                               "Speaker Mode", "Could not save the cover"]
       }
       notifyProc.running = true
